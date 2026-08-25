@@ -1,0 +1,10 @@
+bin/
+obj/
+.vs/
+TestResults/
+*.user
+*.suo
+*.pkg
+*.iso
+*.ciso
+

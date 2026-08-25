@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>ProsperoPkgTool.Gui</AssemblyName>
+    <RootNamespace>ProsperoPkgTool.Gui</RootNamespace>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\ProsperoPkgTool\ProsperoPkgTool.csproj" />
+  </ItemGroup>
+</Project>
+

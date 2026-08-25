@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="ProsperoPkgTool/ProsperoPkgTool.csproj" />
+  <Project Path="ProsperoPkgTool.Gui/ProsperoPkgTool.Gui.csproj" />
+  <Project Path="ProsperoPkgTool.Tests/ProsperoPkgTool.Tests.csproj" />
+</Solution>
+
