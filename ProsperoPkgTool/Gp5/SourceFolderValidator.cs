@@ -41,8 +41,22 @@ public static class SourceFolderValidator
             }
         }
 
-        if (param?.ApplicationCategoryType == 0 && !File.Exists(Path.Combine(root, "eboot.bin")))
-            report.Error("EBOOT_MISSING", "Application source requires eboot.bin.", Path.Combine(root, "eboot.bin"));
+        if (param?.ApplicationCategoryType == 0)
+        {
+            if (!File.Exists(Path.Combine(root, "eboot.bin")))
+                report.Error("EBOOT_MISSING", "Application source requires eboot.bin.", Path.Combine(root, "eboot.bin"));
+            if (param.ApplicationDrmType == "free")
+                report.Error("PARAM_DRM_COMBINATION",
+                    "Sony Publishing Tools 1.21 rejects applicationCategoryType 0 with applicationDrmType 'free'.",
+                    paramPath);
+            WarnIfMissing(report, root, "sce_sys/pic0.png", "Sony verification requires pic0.png for an original application package.");
+            WarnIfMissing(report, root, "sce_sys/pic1.png", "Sony verification requires pic1.png for an original application package.");
+            WarnIfMissing(report, root, "sce_sys/pic2.png", "Sony verification requires pic2.png for an original application package.");
+            if (!Directory.Exists(Path.Combine(root, "sce_module")))
+                report.Warning("SCE_MODULE_MISSING",
+                    "Sony verification requires sce_module for an original application package.",
+                    Path.Combine(root, "sce_module"));
+        }
         if (!File.Exists(Path.Combine(root, "sce_sys", "icon0.png")))
             report.Warning("ICON_MISSING", "sce_sys/icon0.png is not present.", Path.Combine(root, "sce_sys", "icon0.png"));
 
@@ -75,6 +89,13 @@ public static class SourceFolderValidator
         return new SourceFolderInspection(root, param, playGo, included, excluded, report);
     }
 
+    private static void WarnIfMissing(ValidationReport report, string root, string relativePath, string message)
+    {
+        string fullPath = Path.Combine(root, relativePath.Replace('/', Path.DirectorySeparatorChar));
+        if (!File.Exists(fullPath))
+            report.Warning("MEDIA_MISSING", message, fullPath);
+    }
+
     public static bool IsPublishingArtifact(string relativePath)
     {
         string path = relativePath.Replace('\\', '/').TrimStart('/');
@@ -82,10 +103,14 @@ public static class SourceFolderValidator
             return true;
 
         string lower = path.ToLowerInvariant();
+        if (lower.StartsWith("sce_sys/about/", StringComparison.Ordinal) ||
+            lower.EndsWith(".esbak", StringComparison.Ordinal))
+            return true;
         if (lower is "sce_sys/playgo-chunk.dat" or "sce_sys/playgo-ficm.dat" or
             "sce_sys/playgo-hash-table.dat" or "sce_sys/imagedigs.dat" or
             "sce_sys/pfs-version.dat" or "sce_sys/keystone" or
-            "sce_sys/nptitle.dat" or "sce_sys/npbind.dat")
+            "sce_sys/npbind.dat" or
+            "sce_sys/ext_info.dat" or "disc_info.dat")
             return true;
 
         string fileName = Path.GetFileName(path);

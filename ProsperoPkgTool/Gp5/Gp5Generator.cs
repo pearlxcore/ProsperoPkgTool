@@ -94,6 +94,7 @@ public static class Gp5Generator
             {
                 Id = chunk.Id,
                 Label = chunk.Label,
+                Languages = $"0x{chunk.LanguageMask:X16}",
             });
         }
         foreach (PlayGoScenario scenario in playGo.Scenarios)
@@ -129,4 +130,3 @@ public static class Gp5Generator
         return string.Join(' ', parts);
     }
 }
-

@@ -7,6 +7,24 @@ namespace ProsperoPkgTool.Tests;
 public sealed class PlayGoChunkReaderTests
 {
     [Fact]
+    public void ReadsTwoChunkTwoScenarioOracleArtifact()
+    {
+        // Captured from a controlled, locally generated original-tool package: two chunks,
+        // two playmode scenarios, scenario 1 sequence [0, 1]. It is evidence for reader
+        // interoperability only; it does not authorize a PLGX writer.
+        byte[] data = Convert.FromBase64String(
+            "cGxneAAQAAABAAIAAAACAAACAAAAAAEAAAAAAAAAhQACAAAAAQAAAAAAAAAAAAAAEQAAAAAAAAD//////////0lWOTk5OS1QUFNYNDAwMDBfMDAtWFhYWFhYWFhYWFhYWFhYWAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAEAAAABAAQAACAAAAFABAAASAAAAcAEAACAAAACQAQAAQAAAANABAAAGAAAA4AEAABgAAAAAAAAAAAAAAIAAAwACAAAAEQAAAAAAAAD//////////wAAAAAAAAAAgAADAAAAAAARAAAAAAAAAP//////////CAAAAAkAAAAAAAAAAQAAAAAAAAAAAAAAQ2h1bmsgIzAAQ2h1bmsgIzEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAEAAAAAAAAAAcAAAAAACEAAAAAAAAAAAAAAAAAAAAAAAAAAQABAAAAAAAAAAAAIQAAAAAAAAAAAAAAAAAAAAAAAAABAAIAAgAAAAwAAAAAAAAAAQAAAAAAAAAAAAAAU2NlbmFyaW8gIzAAU2NlbmFyaW8gIzEAAAAAAAAAAAA=");
+
+        PlayGoProject project = PlayGoChunkReader.Read(data);
+
+        Assert.Equal(["Chunk #0", "Chunk #1"], project.Chunks.Select(chunk => chunk.Label));
+        Assert.Equal(2, project.Scenarios.Count);
+        Assert.Equal([0], project.Scenarios[0].Chunks);
+        Assert.Equal([0, 1], project.Scenarios[1].Chunks);
+        Assert.Equal(1, project.Scenarios[1].InitialChunkCount);
+    }
+
+    [Fact]
     public void ReadsRealScenarioSequenceInsteadOfAssigningAllChunks()
     {
         byte[] data = BuildTwoChunkFile();
@@ -83,4 +101,3 @@ public sealed class PlayGoChunkReaderTests
     private static void WriteU64(byte[] data, int at, ulong value) =>
         BinaryPrimitives.WriteUInt64LittleEndian(data.AsSpan(at, 8), value);
 }
-

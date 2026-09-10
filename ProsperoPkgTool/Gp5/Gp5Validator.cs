@@ -141,27 +141,25 @@ public static partial class Gp5Validator
             report.Error("ENTRY_CHUNK", $"Entry chunk {entry.Chunk} is not defined.", entry.DestinationPath);
 
         bool needsSource = entry is Gp5FileEntry || entry is Gp5DirectoryEntry { Virtual: false };
-        if (needsSource && string.IsNullOrWhiteSpace(entry.SourcePath))
-        {
-            report.Error("SOURCE_PATH", "A non-virtual entry requires src_path.", entry.DestinationPath);
-            return;
-        }
-        if (projectPath is null || string.IsNullOrWhiteSpace(entry.SourcePath))
+        string? sourcePath = entry.SourcePath;
+        if (needsSource && string.IsNullOrWhiteSpace(sourcePath))
+            sourcePath = entry.DestinationPath;
+        if (projectPath is null || string.IsNullOrWhiteSpace(sourcePath))
             return;
 
         try
         {
-            string resolved = Gp5Path.ResolveSource(projectPath, entry.SourcePath);
+            string resolved = Gp5Path.ResolveSource(projectPath, sourcePath);
             string projectDirectory = Path.GetDirectoryName(Path.GetFullPath(projectPath))!;
             if (!Gp5Path.IsWithin(projectDirectory, resolved))
-                report.Warning("EXTERNAL_SOURCE", "Source path is outside the GP5 project directory.", entry.SourcePath);
+                report.Warning("EXTERNAL_SOURCE", "Source path is outside the GP5 project directory.", sourcePath);
             bool exists = entry is Gp5FileEntry ? File.Exists(resolved) : Directory.Exists(resolved);
             if (!exists)
-                report.Error("SOURCE_MISSING", "Source path does not exist.", entry.SourcePath);
+                report.Error("SOURCE_MISSING", "Source path does not exist.", sourcePath);
         }
         catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException)
         {
-            report.Error("SOURCE_PATH", exception.Message, entry.SourcePath);
+            report.Error("SOURCE_PATH", exception.Message, sourcePath);
         }
     }
 

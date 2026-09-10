@@ -11,9 +11,14 @@
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
+    <!-- Independent BC7 decoder used only to verify ProsperoDdsEncoder's clean-room output. -->
+    <PackageReference Include="BCnEncoder.Net" Version="2.3.0" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\ProsperoPkgTool\ProsperoPkgTool.csproj" />
+    <ProjectReference Include="..\ProsperoPkgTool.Gui\ProsperoPkgTool.Gui.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Fixtures\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
-

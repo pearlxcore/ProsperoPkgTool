@@ -1,9 +1,9 @@
 <Project>
   <PropertyGroup>
-    <LangVersion>latest</LangVersion>
-    <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'LibProsperoPkg'">
+    <NoWarn>$(NoWarn);CS0649</NoWarn>
   </PropertyGroup>
 </Project>
-

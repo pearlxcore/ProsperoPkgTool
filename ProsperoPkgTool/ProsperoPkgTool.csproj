@@ -1,10 +1,16 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0-windows</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <AssemblyName>ProsperoPkgTool</AssemblyName>
     <RootNamespace>ProsperoPkgTool</RootNamespace>
-    <Version>0.1.0</Version>
+    <Version>0.3.0</Version>
   </PropertyGroup>
-</Project>
 
+  <ItemGroup>
+    <EmbeddedResource Include="Keys\passcode.bin" />
+    <EmbeddedResource Include="Keys\mount_image.bin" />
+    <EmbeddedResource Include="Keys\metadata_modulus.bin" />
+    <EmbeddedResource Include="Resources\right.sprx" LogicalName="ProsperoPkgTool.Resources.right.sprx" />
+  </ItemGroup>
+</Project>

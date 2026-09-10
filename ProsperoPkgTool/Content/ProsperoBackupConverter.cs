@@ -1,0 +1,428 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
+
+namespace ProsperoPkgTool.Content;
+
+/// <summary>
+/// Options for <see cref="ProsperoBackupConverter"/>. Only <see cref="BackupFolder"/> and
+/// <see cref="OutputFolder"/> are required; the content id, passcode and version default from the
+/// backup's <c>sce_sys/param.json</c>.
+/// </summary>
+public sealed class ProsperoBackupConversionOptions
+{
+    /// <summary>Root folder of the decrypted backup (the folder that holds <c>sce_sys/</c>).</summary>
+    public string BackupFolder { get; set; } = "";
+
+    /// <summary>Folder the finished <c>*.pkg</c> is written to.</summary>
+    public string OutputFolder { get; set; } = "";
+
+    /// <summary>
+    /// Name of the subtree that holds the raw ELF copies of the executable modules, relative to
+    /// <see cref="BackupFolder"/>. Defaults to <c>decrypted</c>.
+    /// </summary>
+    public string DecryptedSubfolder { get; set; } = "decrypted";
+
+    /// <summary>
+    /// 36-character content id. When left empty it is read from the backup's
+    /// <c>sce_sys/param.json</c> <c>contentId</c> field.
+    /// </summary>
+    public string ContentId { get; set; } = "";
+
+    /// <summary>32-character passcode. Defaults to the all-zero debug passcode.</summary>
+    public string Passcode { get; set; } = ProsperoDebugLicense.DefaultPasscode;
+
+    /// <summary>
+    /// Content version formatted <c>NN.NN</c>. When left empty it is derived from the backup's
+    /// <c>param.json</c>, falling back to <c>01.00</c>. Informational: the build packages the
+    /// <c>param.json</c> content version verbatim.
+    /// </summary>
+    public string Version { get; set; } = "";
+
+    /// <summary>
+    /// Folder used to assemble the merged source tree. When left empty a temporary folder is created
+    /// under <see cref="OutputFolder"/> and removed after the build unless <see cref="KeepStaging"/>
+    /// is set.
+    /// </summary>
+    public string StagingFolder { get; set; } = "";
+
+    /// <summary>When true the assembled source tree is kept after the build. Off by default.</summary>
+    public bool KeepStaging { get; set; }
+
+    /// <summary>
+    /// When true the backup's <c>sce_sys/about/right.sprx</c> is dropped so the build injects its
+    /// embedded debug module instead of fake-signing the backup's own module. Off by default (the
+    /// backup's module is substituted and fake-signed like every other executable).
+    /// </summary>
+    public bool UseEmbeddedRightSprx { get; set; }
+}
+
+/// <summary>
+/// The assembled source tree and module classification produced by
+/// <see cref="ProsperoBackupConverter.Stage"/>. The caller owns the staging folder and must remove it
+/// when done (unless <see cref="ProsperoBackupConversionOptions.KeepStaging"/> is set).
+/// </summary>
+public sealed class ProsperoBackupStagingResult
+{
+    /// <summary>The assembled source tree.</summary>
+    public required string StagingFolder { get; init; }
+
+    /// <summary>The resolved 36-character content id.</summary>
+    public required string ContentId { get; init; }
+
+    /// <summary>The resolved 32-character passcode.</summary>
+    public required string Passcode { get; init; }
+
+    /// <summary>The resolved content version.</summary>
+    public required string Version { get; init; }
+
+    /// <summary>The debug grant for the resolved content id and passcode.</summary>
+    public required ProsperoDebugLicense DebugLicense { get; init; }
+
+    /// <summary>Relative paths of the modules substituted with their raw ELF copy from the decrypted subtree.</summary>
+    public required IReadOnlyList<string> SubstitutedModules { get; init; }
+
+    /// <summary>Relative paths of modules that were already raw ELF at their normal path.</summary>
+    public required IReadOnlyList<string> PlaintextModules { get; init; }
+
+    /// <summary>Relative paths of signed modules with no raw ELF copy; they are packed unchanged and will not run.</summary>
+    public required IReadOnlyList<string> UnresolvedModules { get; init; }
+
+    /// <summary>Non-fatal warnings from the assembly.</summary>
+    public required IReadOnlyList<string> Warnings { get; init; }
+
+    /// <summary>Launch-readiness of the assembled source tree.</summary>
+    public required ProsperoLaunchReadinessReport LaunchReadiness { get; init; }
+}
+
+/// <summary>The result of a backup conversion.</summary>
+public sealed class ProsperoBackupConversionResult
+{
+    /// <summary>Path to the finished debug package.</summary>
+    public required string OutputPath { get; init; }
+
+    /// <summary>The debug grant for the package.</summary>
+    public required ProsperoDebugLicense DebugLicense { get; init; }
+
+    /// <summary>Relative paths of the modules substituted with their raw ELF copy (and then fake-signed).</summary>
+    public required IReadOnlyList<string> SubstitutedModules { get; init; }
+
+    /// <summary>Relative paths of modules that were already raw ELF and were fake-signed in place.</summary>
+    public required IReadOnlyList<string> PlaintextModules { get; init; }
+
+    /// <summary>Relative paths of signed modules with no raw ELF copy; they are packed unchanged and will not run.</summary>
+    public required IReadOnlyList<string> UnresolvedModules { get; init; }
+
+    /// <summary>Non-fatal warnings from the assembly and the build.</summary>
+    public required IReadOnlyList<string> Warnings { get; init; }
+
+    /// <summary>Launch-readiness of the assembled source tree.</summary>
+    public required ProsperoLaunchReadinessReport LaunchReadiness { get; init; }
+
+    /// <summary>The assembled source tree, when <see cref="ProsperoBackupConversionOptions.KeepStaging"/> is set; otherwise empty.</summary>
+    public required string StagingFolder { get; init; }
+}
+
+/// <summary>
+/// Converts a decrypted application backup into an installable debug package. A decrypted backup
+/// carries the application's data and metadata in the clear alongside its executable modules in two
+/// forms: the on-disk signed/encrypted modules at their normal paths, and raw ELF copies of the same
+/// modules under a <c>decrypted</c> subtree. This converter assembles a single source tree that keeps
+/// the plaintext data and metadata, substitutes each raw ELF for its signed/encrypted counterpart,
+/// then hands the tree to the supplied build callback with fake-signing enabled. The result is a
+/// debug image whose mount key is derived from the content id and passcode, so it installs and runs
+/// on a debug-mode console with no license record.
+/// </summary>
+public static class ProsperoBackupConverter
+{
+    private const uint ElfMagic = 0x464C457FU;   // 0x7F 'E' 'L' 'F'
+    private const uint SelfMagic = ProsperoSelfBuilder.Magic;
+    private const ulong AuthorityMask = 0xFF00000000000000UL;
+    private const ulong FakeAuthorityPrefix = 0x3100000000000000UL;
+
+    /// <summary>
+    /// Assembles the merged source tree from the backup and classifies its modules. The caller owns
+    /// the returned staging folder and must remove it (unless <see cref="ProsperoBackupConversionOptions.KeepStaging"/>).
+    /// </summary>
+    /// <exception cref="ArgumentException"><paramref name="options"/> or a required field is invalid.</exception>
+    public static ProsperoBackupStagingResult Stage(
+        ProsperoBackupConversionOptions options, Action<string>? logger = null)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        var log = logger ?? (_ => { });
+        var warnings = new List<string>();
+
+        if (string.IsNullOrWhiteSpace(options.BackupFolder) || !Directory.Exists(options.BackupFolder))
+            throw new ArgumentException("Backup folder does not exist.", nameof(options));
+        if (string.IsNullOrWhiteSpace(options.OutputFolder))
+            throw new ArgumentException("Output folder was not specified.", nameof(options));
+
+        string backup = Path.GetFullPath(options.BackupFolder);
+        if (!Directory.Exists(Path.Combine(backup, "sce_sys")))
+            throw new ArgumentException("Backup folder does not contain a sce_sys directory.", nameof(options));
+
+        string decryptedRoot = Path.Combine(backup, options.DecryptedSubfolder);
+        bool hasDecrypted = Directory.Exists(decryptedRoot);
+        if (!hasDecrypted)
+            warnings.Add($"No '{options.DecryptedSubfolder}' subtree was found; signed modules cannot be substituted and the package will not run.");
+
+        ParamMeta paramMeta = ReadParamMeta(Path.Combine(backup, "sce_sys", "param.json"));
+        string contentId = !string.IsNullOrWhiteSpace(options.ContentId) ? options.ContentId.Trim() : paramMeta.ContentId;
+        if (string.IsNullOrWhiteSpace(contentId))
+            throw new ArgumentException("Content id was not supplied and could not be read from param.json.", nameof(options));
+
+        string passcode = string.IsNullOrEmpty(options.Passcode) ? ProsperoDebugLicense.DefaultPasscode : options.Passcode;
+        string version = !string.IsNullOrWhiteSpace(options.Version) ? options.Version
+            : (!string.IsNullOrWhiteSpace(paramMeta.Version) ? paramMeta.Version : "01.00");
+        if (!string.IsNullOrWhiteSpace(options.Version) &&
+            !string.Equals(options.Version, paramMeta.Version, StringComparison.Ordinal))
+        {
+            warnings.Add($"Version override '{options.Version}' is not applied; the package uses the sce_sys/param.json version.");
+        }
+
+        // Construct the grant up front so a malformed content id or passcode fails before any file work.
+        ProsperoDebugLicense debugLicense = ProsperoDebugLicense.Create(contentId, passcode);
+
+        string staging = string.IsNullOrWhiteSpace(options.StagingFolder)
+            ? Path.Combine(options.OutputFolder, "." + SafeName(contentId) + ".convert.tmp")
+            : Path.GetFullPath(options.StagingFolder);
+
+        var substituted = new List<string>();
+        var plaintext = new List<string>();
+        var unresolved = new List<string>();
+
+        if (Directory.Exists(staging))
+            Directory.Delete(staging, recursive: true);
+        Directory.CreateDirectory(staging);
+
+        try
+        {
+            AssembleTree(backup, decryptedRoot, hasDecrypted, staging, options, log, warnings,
+                substituted, plaintext, unresolved);
+        }
+        catch
+        {
+            try { if (Directory.Exists(staging)) Directory.Delete(staging, recursive: true); }
+            catch (IOException) { log($"Warning: could not remove the temporary tree '{staging}'."); }
+            throw;
+        }
+
+        foreach (string rel in unresolved)
+            warnings.Add($"Module '{rel}' is signed with no decrypted copy; it is packed unchanged and will not run.");
+
+        ProsperoLaunchReadinessReport readiness = ProsperoLaunchReadiness.InspectAppRoot(staging);
+
+        return new ProsperoBackupStagingResult
+        {
+            StagingFolder = staging,
+            ContentId = contentId,
+            Passcode = passcode,
+            Version = version,
+            DebugLicense = debugLicense,
+            SubstitutedModules = substituted,
+            PlaintextModules = plaintext,
+            UnresolvedModules = unresolved,
+            Warnings = warnings,
+            LaunchReadiness = readiness,
+        };
+    }
+
+    /// <summary>
+    /// Assembles the merged source tree from the backup, invokes <paramref name="build"/> on it, and
+    /// reports the module classification plus launch-readiness. The staging tree is removed afterwards
+    /// unless <see cref="ProsperoBackupConversionOptions.KeepStaging"/> is set.
+    /// </summary>
+    /// <param name="options">The conversion inputs.</param>
+    /// <param name="build">Builds a package from the staged tree and returns the output package path.</param>
+    /// <param name="logger">Optional progress callback.</param>
+    public static ProsperoBackupConversionResult Convert(
+        ProsperoBackupConversionOptions options,
+        Func<ProsperoBackupStagingResult, string> build,
+        Action<string>? logger = null)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(build);
+        var log = logger ?? (_ => { });
+        var warnings = new List<string>();
+
+        ProsperoBackupStagingResult staging = Stage(options, log);
+        warnings.AddRange(staging.Warnings);
+
+        try
+        {
+            log($"Building debug package for {staging.ContentId} from the assembled tree.");
+            string outputPath = build(staging);
+
+            // Read the assembled tree back against the launch conditions while it is still present.
+            ProsperoLaunchReadinessReport readiness = ProsperoLaunchReadiness.InspectAppRoot(staging.StagingFolder);
+
+            return new ProsperoBackupConversionResult
+            {
+                OutputPath = outputPath,
+                DebugLicense = staging.DebugLicense,
+                SubstitutedModules = staging.SubstitutedModules,
+                PlaintextModules = staging.PlaintextModules,
+                UnresolvedModules = staging.UnresolvedModules,
+                Warnings = warnings,
+                LaunchReadiness = readiness,
+                StagingFolder = options.KeepStaging ? staging.StagingFolder : "",
+            };
+        }
+        finally
+        {
+            if (!options.KeepStaging)
+            {
+                try { if (Directory.Exists(staging.StagingFolder)) Directory.Delete(staging.StagingFolder, recursive: true); }
+                catch (IOException) { log($"Warning: could not remove the temporary tree '{staging.StagingFolder}'."); }
+            }
+        }
+    }
+
+    // Copies the backup into the staging tree, excluding the decrypted subtree, substituting each
+    // signed executable module with its raw ELF copy where one exists.
+    private static void AssembleTree(
+        string backup, string decryptedRoot, bool hasDecrypted, string staging,
+        ProsperoBackupConversionOptions options, Action<string> log, List<string> warnings,
+        List<string> substituted, List<string> plaintext, List<string> unresolved)
+    {
+        string decryptedFull = hasDecrypted ? Path.GetFullPath(decryptedRoot) : "";
+
+        foreach (string file in Directory.EnumerateFiles(backup, "*", SearchOption.AllDirectories))
+        {
+            string full = Path.GetFullPath(file);
+            // Skip the decrypted subtree itself; it is a source of substitutions, not a tree member.
+            if (hasDecrypted && IsUnder(full, decryptedFull))
+                continue;
+
+            string rel = Path.GetRelativePath(backup, full);
+            string relNorm = rel.Replace('\\', '/');
+
+            // Drop the backup's own right.sprx so the build injects its embedded debug module.
+            if (options.UseEmbeddedRightSprx
+                && relNorm.Equals("sce_sys/about/right.sprx", StringComparison.OrdinalIgnoreCase))
+            {
+                log("Dropping the backup right.sprx; the embedded debug module will be used.");
+                continue;
+            }
+
+            string target = Path.Combine(staging, rel);
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+
+            if (IsModuleCandidate(Path.GetFileName(rel)))
+            {
+                uint magic = ReadMagic(full);
+                if (magic == ElfMagic)
+                {
+                    // Already a raw ELF at its normal path; the build's fake-sign step converts it.
+                    File.Copy(full, target, overwrite: true);
+                    plaintext.Add(relNorm);
+                    continue;
+                }
+
+                if (magic == SelfMagic)
+                {
+                    string? decrypted = hasDecrypted ? Path.Combine(decryptedRoot, rel) : null;
+                    if (decrypted is not null && File.Exists(decrypted) && ReadMagic(decrypted) == ElfMagic)
+                    {
+                        File.Copy(decrypted, target, overwrite: true);
+                        substituted.Add(relNorm);
+                        log($"Substituted decrypted module for {relNorm}.");
+                        continue;
+                    }
+
+                    File.Copy(full, target, overwrite: true);
+                    if (IsFakeAuthoritySelf(full))
+                    {
+                        // Already a fake-authority SELF: it runs on a debug console as-is, so it is not
+                        // an unresolved module even without a decrypted copy.
+                        plaintext.Add(relNorm);
+                        log($"Kept already fake-signed module {relNorm}.");
+                    }
+                    else
+                    {
+                        // Genuine signed module with no decrypted copy: pack it unchanged and flag it.
+                        unresolved.Add(relNorm);
+                    }
+                    continue;
+                }
+            }
+
+            // Data or metadata: copy verbatim.
+            File.Copy(full, target, overwrite: true);
+        }
+    }
+
+    // Executable-module file names/extensions that participate in substitution + fake-signing.
+    private static bool IsModuleCandidate(string fileName) =>
+        fileName.Equals("eboot.bin", StringComparison.OrdinalIgnoreCase)
+        || fileName.EndsWith(".elf", StringComparison.OrdinalIgnoreCase)
+        || fileName.EndsWith(".prx", StringComparison.OrdinalIgnoreCase)
+        || fileName.EndsWith(".sprx", StringComparison.OrdinalIgnoreCase);
+
+    private static uint ReadMagic(string path)
+    {
+        try
+        {
+            using FileStream fs = File.OpenRead(path);
+            Span<byte> head = stackalloc byte[4];
+            if (fs.ReadAtLeast(head, 4, throwOnEndOfStream: false) < 4)
+                return 0;
+            return (uint)(head[0] | (head[1] << 8) | (head[2] << 16) | (head[3] << 24));
+        }
+        catch (IOException) { return 0; }
+    }
+
+    // True when the file is a SELF whose extended-info authority id carries the fake-authority prefix,
+    // i.e. a module that already runs on a debug-mode console without substitution.
+    private static bool IsFakeAuthoritySelf(string path)
+    {
+        try
+        {
+            byte[] bytes = File.ReadAllBytes(path);
+            return ProsperoSelfReader.TryReadAuthorityId(bytes, out ulong authorityId) &&
+                (authorityId & AuthorityMask) == FakeAuthorityPrefix;
+        }
+        catch (IOException) { return false; }
+    }
+
+    private static bool IsUnder(string path, string root)
+    {
+        string p = path.TrimEnd(Path.DirectorySeparatorChar);
+        string r = root.TrimEnd(Path.DirectorySeparatorChar);
+        return p.Equals(r, StringComparison.OrdinalIgnoreCase)
+            || p.StartsWith(r + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string SafeName(string contentId)
+    {
+        Span<char> buffer = stackalloc char[contentId.Length];
+        for (int i = 0; i < contentId.Length; i++)
+        {
+            char c = contentId[i];
+            buffer[i] = char.IsLetterOrDigit(c) || c is '-' or '_' ? c : '_';
+        }
+        return new string(buffer);
+    }
+
+    private readonly record struct ParamMeta(string ContentId, string Version);
+
+    private static ParamMeta ReadParamMeta(string paramPath)
+    {
+        if (!File.Exists(paramPath))
+            return new ParamMeta("", "");
+        try
+        {
+            var root = JsonNode.Parse(File.ReadAllText(paramPath)) as JsonObject;
+            if (root is null)
+                return new ParamMeta("", "");
+            string cid = root.TryGetPropertyValue("contentId", out JsonNode? c) && c is JsonValue cv && cv.TryGetValue(out string? cs) ? cs ?? "" : "";
+            string ver = "";
+            if (root.TryGetPropertyValue("contentVersion", out JsonNode? cvn) && cvn is JsonValue cvv && cvv.TryGetValue(out string? cvs) && !string.IsNullOrWhiteSpace(cvs))
+                ver = cvs!;
+            else if (root.TryGetPropertyValue("masterVersion", out JsonNode? mvn) && mvn is JsonValue mvv && mvv.TryGetValue(out string? mvs))
+                ver = mvs ?? "";
+            return new ParamMeta(cid, ver);
+        }
+        catch (JsonException) { return new ParamMeta("", ""); }
+        catch (IOException) { return new ParamMeta("", ""); }
+    }
+}

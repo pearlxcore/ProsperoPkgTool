@@ -8,8 +8,12 @@ public sealed record ProsperoParam(
     string ContentId,
     string? ContentVersion,
     int ApplicationCategoryType,
-    string? CreationDate)
+    string? CreationDate,
+    string? ApplicationDrmType)
 {
+    /// <summary>Optional human-readable title (param.json <c>titleName</c>); empty when absent.</summary>
+    public string? TitleName { get; init; }
+
     public string VolumeType => ApplicationCategoryType == 1
         ? Gp5Constants.AdditionalContentVolume
         : Gp5Constants.ApplicationVolume;
@@ -20,14 +24,26 @@ public static partial class ProsperoParamReader
     public static ProsperoParam Read(string path)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
-        byte[] data = File.ReadAllBytes(path);
+        return Read(File.ReadAllBytes(path));
+    }
+
+    public static ProsperoParam Read(byte[] data)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        using var stream = new MemoryStream(data, writable: false);
+        return Read(stream);
+    }
+
+    public static ProsperoParam Read(Stream stream)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
         var options = new JsonDocumentOptions
         {
             AllowTrailingCommas = false,
             CommentHandling = JsonCommentHandling.Disallow,
             MaxDepth = 64,
         };
-        using JsonDocument document = JsonDocument.Parse(data, options);
+        using JsonDocument document = JsonDocument.Parse(stream, options);
         JsonElement root = document.RootElement;
         if (root.ValueKind != JsonValueKind.Object)
             throw new InvalidDataException("param.json root must be an object.");
@@ -36,6 +52,7 @@ public static partial class ProsperoParamReader
         string contentId = RequiredString(root, "contentId");
         string? contentVersion = OptionalString(root, "contentVersion");
         int category = OptionalInt(root, "applicationCategoryType") ?? 0;
+        string? applicationDrmType = OptionalString(root, "applicationDrmType");
         string? creationDate = null;
         if (root.TryGetProperty("pubtools", out JsonElement pubtools))
         {
@@ -52,8 +69,14 @@ public static partial class ProsperoParamReader
             throw new InvalidDataException("param.json contentId does not contain its titleId.");
         if (category is not 0 and not 1)
             throw new InvalidDataException("applicationCategoryType must be 0 (application) or 1 (additional content).");
+        if (applicationDrmType is not null &&
+            applicationDrmType is not "standard" and not "free" and not "freemium")
+            throw new InvalidDataException("applicationDrmType must be standard, free, or freemium.");
 
-        return new ProsperoParam(titleId, contentId, contentVersion, category, creationDate);
+        return new ProsperoParam(titleId, contentId, contentVersion, category, creationDate, applicationDrmType)
+        {
+            TitleName = OptionalString(root, "titleName"),
+        };
     }
 
     private static string RequiredString(JsonElement parent, string name) =>
@@ -85,4 +108,3 @@ public static partial class ProsperoParamReader
     [GeneratedRegex("^[A-Z]{2}[0-9]{4}-[A-Z0-9]{9}_[0-9]{2}-[A-Z0-9]{16}$", RegexOptions.CultureInvariant)]
     private static partial Regex ContentIdRegex();
 }
-

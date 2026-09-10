@@ -8,7 +8,7 @@ public sealed class ContainerBackendCatalogTests
     public void CatalogReservesAllPlannedFormats()
     {
         string[] formats = ContainerBackendCatalog.All.Select(item => item.FormatId).ToArray();
-        Assert.Contains("sony-pkg", formats);
+        Assert.Contains("ps5-pkg", formats);
         Assert.Contains("ffpkg", formats);
         Assert.Contains("ffpfsc", formats);
         Assert.Contains("exfat", formats);
@@ -16,12 +16,11 @@ public sealed class ContainerBackendCatalogTests
     }
 
     [Fact]
-    public void OnlySonyBackendIsAvailableInFoundationMilestone()
+    public void NativePs5PackageBackendIsExperimental()
     {
-        ContainerBackendDescriptor available = Assert.Single(ContainerBackendCatalog.All,
-            item => item.Status == ContainerBackendStatus.Available);
-        Assert.Equal("sony-pkg", available.FormatId);
-        Assert.True(available.Capabilities.HasFlag(ContainerCapabilities.Create));
+        ContainerBackendDescriptor backend = Assert.Single(ContainerBackendCatalog.All,
+            item => item.FormatId == "ps5-pkg");
+        Assert.Equal(ContainerBackendStatus.Experimental, backend.Status);
+        Assert.True(backend.Capabilities.HasFlag(ContainerCapabilities.Create));
     }
 }
-

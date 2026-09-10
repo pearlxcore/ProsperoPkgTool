@@ -4,7 +4,7 @@ public static class ContainerBackendCatalog
 {
     public static IReadOnlyList<ContainerBackendDescriptor> All { get; } =
     [
-        new("sony-pkg", "Sony CNT/FIH package", ContainerBackendStatus.Available,
+        new("ps5-pkg", "PS5 CNT/FIH fake/debug package", ContainerBackendStatus.Experimental,
             ContainerCapabilities.Inspect | ContainerCapabilities.List |
             ContainerCapabilities.Extract | ContainerCapabilities.Verify |
             ContainerCapabilities.Create),
@@ -18,4 +18,3 @@ public static class ContainerBackendCatalog
             ContainerCapabilities.None),
     ];
 }
-

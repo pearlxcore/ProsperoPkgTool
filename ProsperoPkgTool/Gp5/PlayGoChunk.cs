@@ -19,6 +19,12 @@ public sealed class PlayGoProject
     public int DefaultScenarioId { get; init; }
     public IReadOnlyList<PlayGoChunk> Chunks { get; init; } = [];
     public IReadOnlyList<PlayGoScenario> Scenarios { get; init; } = [];
+    /// <summary>
+    /// Explicit clean-room mapping of normalized inner-PFS file paths to chunk IDs. Entries not
+    /// present here use chunk zero in the debug/nwonly source-folder model.
+    /// </summary>
+    public IReadOnlyDictionary<string, byte> FileChunkAssignments { get; init; } =
+        new Dictionary<string, byte>(StringComparer.Ordinal);
 }
 
 public static class PlayGoChunkReader
@@ -168,4 +174,3 @@ public static class PlayGoChunkReader
 
     private readonly record struct Section(int Offset, int Size);
 }
-

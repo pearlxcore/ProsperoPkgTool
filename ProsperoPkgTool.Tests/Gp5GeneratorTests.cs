@@ -43,6 +43,53 @@ public sealed class Gp5GeneratorTests
         Assert.Equal(0, validated);
     }
 
+    [Fact]
+    public void RejectsSonyConfirmedFreeDrmApplicationCombination()
+    {
+        using var fixture = new SourceFixture();
+        string paramPath = Path.Combine(fixture.Root, "sce_sys", "param.json");
+        string json = File.ReadAllText(paramPath).Replace(
+            "\"applicationCategoryType\": 0,",
+            "\"applicationCategoryType\": 0,\n  \"applicationDrmType\": \"free\",");
+        File.WriteAllText(paramPath, json);
+
+        SourceFolderInspection result = SourceFolderValidator.Inspect(fixture.Root);
+
+        Assert.False(result.Validation.IsValid);
+        Assert.Contains(result.Validation.Issues, issue => issue.Code == "PARAM_DRM_COMBINATION");
+    }
+
+    [Theory]
+    [InlineData("eboot.bin.esbak")]
+    [InlineData("sce_module/libc.prx.esbak")]
+    [InlineData("sce_sys/about/right.sprx")]
+    [InlineData("sce_sys/ext_info.dat")]
+    [InlineData("disc_info.dat")]
+    public void ExcludesPublishingAndDumpArtifacts(string relativePath)
+    {
+        Assert.True(SourceFolderValidator.IsPublishingArtifact(relativePath));
+    }
+
+    [Fact]
+    public void ValidatesSonyImplicitSourcePathAgainstDestination()
+    {
+        using var fixture = new SourceFixture();
+        string projectPath = Path.Combine(fixture.Root, "implicit.gp5");
+        var project = Gp5Generator.Generate(fixture.Root, intendedProjectPath: projectPath).Project;
+        foreach (Gp5FileEntry file in project.Files)
+            file.SourcePath = null;
+
+        ValidationReport validation = Gp5Validator.Validate(project, projectPath);
+
+        Assert.DoesNotContain(validation.Issues, issue => issue.Code is "SOURCE_PATH" or "SOURCE_MISSING");
+    }
+
+    [Fact]
+    public void IncludesRequiredNpTitleSystemEntry()
+    {
+        Assert.False(SourceFolderValidator.IsPublishingArtifact("sce_sys/nptitle.dat"));
+    }
+
     internal sealed class SourceFixture : IDisposable
     {
         public SourceFixture()

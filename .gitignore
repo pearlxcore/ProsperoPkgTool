@@ -1,10 +1,37 @@
-bin/
-obj/
-.vs/
+# Build output
+[Bb]in/
+[Oo]bj/
 TestResults/
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
 *.user
 *.suo
+*.userosscache
+*.sln.docstates
+
+# Package / image artifacts
 *.pkg
+*.ffpkg
+*.ffpfsc
 *.iso
 *.ciso
 
+# Documentation: keep README only
+*.md
+!README.md
+
+# Recon / scratch dumps (large generated metadata)
+/*.json
+*.naps_metric.json
+*.structure.csv
+
+# Logs / traces
+*.log
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
