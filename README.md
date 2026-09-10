@@ -121,3 +121,8 @@ briefly linked the GPL-3.0 `LibProsperoPKG` library and wrapped Sony's
 `prospero-pub-cmd.exe`; both have been **completely removed** so the project carries no
 copyleft or proprietary-binary obligations. Reverse-engineering findings used to implement
 the format live separately and are not redistributed here.
+
+## Credits
+
+- SvenGDK
+- Sony <3
