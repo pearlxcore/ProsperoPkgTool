@@ -31,6 +31,10 @@ TestResults/
 # Logs / traces
 *.log
 
+# Local-only sources (kept on disk, not tracked)
+tools/
+ProsperoPkgTool.Tests/
+
 # OS junk
 Thumbs.db
 desktop.ini
