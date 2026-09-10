@@ -146,23 +146,26 @@ public sealed class ProsperoInnerImageAssembler
     }
 
     /// <summary>Assemble the inner image from a flat list of files, returning its bytes.</summary>
-    public InnerImageResult Build(IReadOnlyList<InnerFile> files, ProsperoInnerCompressionMode compressionMode = ProsperoInnerCompressionMode.Stored)
-        => BuildCore(files, compressionMode, null);
+    public InnerImageResult Build(IReadOnlyList<InnerFile> files, ProsperoInnerCompressionMode compressionMode = ProsperoInnerCompressionMode.Stored,
+        IProgress<ProsperoBuildProgress>? progress = null)
+        => BuildCore(files, compressionMode, null, progress);
 
     /// <summary>
     /// File-backed counterpart: the physical <c>pfs_image.dat</c> is written directly to
     /// <paramref name="outputPath"/> and <see cref="InnerImageResult.Image"/> is empty, so the image
     /// may exceed the in-memory array limit. All geometry/metadata remains available in the result.
     /// </summary>
-    public InnerImageResult BuildToFile(IReadOnlyList<InnerFile> files, string outputPath, ProsperoInnerCompressionMode compressionMode = ProsperoInnerCompressionMode.Stored)
+    public InnerImageResult BuildToFile(IReadOnlyList<InnerFile> files, string outputPath, ProsperoInnerCompressionMode compressionMode = ProsperoInnerCompressionMode.Stored,
+        IProgress<ProsperoBuildProgress>? progress = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
         string full = Path.GetFullPath(outputPath);
         Directory.CreateDirectory(Path.GetDirectoryName(full) ?? Directory.GetCurrentDirectory());
-        return BuildCore(files, compressionMode, full);
+        return BuildCore(files, compressionMode, full, progress);
     }
 
-    private InnerImageResult BuildCore(IReadOnlyList<InnerFile> files, ProsperoInnerCompressionMode compressionMode, string? outputPath)
+    private InnerImageResult BuildCore(IReadOnlyList<InnerFile> files, ProsperoInnerCompressionMode compressionMode, string? outputPath,
+        IProgress<ProsperoBuildProgress>? progress = null)
     {
         ArgumentNullException.ThrowIfNull(files);
         if (files.Count == 0)
@@ -223,6 +226,7 @@ public sealed class ProsperoInnerImageAssembler
         var encodedBlocks = new List<ProsperoEncodedBlock>();
         int sourceBlockIndex = 0;
         long pos = 0;
+        int fileIndex = 0;
 
         using FileStream? imageFs = outputPath is not null
             ? new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan)
@@ -268,6 +272,8 @@ public sealed class ProsperoInnerImageAssembler
             pos += payload.Length;
             if (f.WholeBlockRaw)
                 pos = RoundUp(pos, BlockSize);
+
+            progress?.Report(new ProsperoBuildProgress("Inner image", ++fileIndex, afidOrder.Count));
         }
 
         long dataEndLogical = afidOrder.Count > 0

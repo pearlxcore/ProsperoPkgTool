@@ -249,7 +249,8 @@ public static class ProsperoOuterPfsBuilder
     /// (assembled + signed, not encrypted). Use <see cref="Encrypt"/> to encrypt in place.
     /// </summary>
     public static OuterPfsBuildResult BuildPlaintext(
-        IReadOnlyList<OuterPfsFile> files, OuterPfsBuildParameters parameters)
+        IReadOnlyList<OuterPfsFile> files, OuterPfsBuildParameters parameters,
+        IProgress<ProsperoBuildProgress>? progress = null)
     {
         ArgumentNullException.ThrowIfNull(files);
         ArgumentNullException.ThrowIfNull(parameters);
@@ -297,6 +298,7 @@ public static class ProsperoOuterPfsBuilder
         {
             byte[] data = files[i].Data;
             Buffer.BlockCopy(data, 0, image, fileFirstBlock[i] * BlockSize, data.Length);
+            progress?.Report(new ProsperoBuildProgress("Outer PFS", i + 1, files.Count));
         }
 
         // ---- 3. Build the structural metadata blocks. ----
@@ -349,7 +351,8 @@ public static class ProsperoOuterPfsBuilder
 
     /// <summary>Encrypt (or decrypt) the built image in place using the given XTS key pair.</summary>
     public static void Encrypt(
-        OuterPfsBuildResult build, ReadOnlySpan<byte> tweakKey, ReadOnlySpan<byte> dataKey, bool encrypt = true)
+        OuterPfsBuildResult build, ReadOnlySpan<byte> tweakKey, ReadOnlySpan<byte> dataKey, bool encrypt = true,
+        IProgress<ProsperoBuildProgress>? progress = null)
     {
         ArgumentNullException.ThrowIfNull(build);
         using var xts = new AesXts(dataKey, tweakKey);
@@ -357,7 +360,10 @@ public static class ProsperoOuterPfsBuilder
         {
             OuterBlockKind kind = build.BlockKinds[i];
             if (kind == OuterBlockKind.Plaintext)
+            {
+                progress?.Report(new ProsperoBuildProgress("Encrypt", i + 1, build.BlockCount));
                 continue;
+            }
             int offset = i * BlockSize;
             ulong sector = kind == OuterBlockKind.Signed
                 ? ((ulong)(uint)i | SignedSectorFlag)
@@ -365,6 +371,7 @@ public static class ProsperoOuterPfsBuilder
             byte[] block = build.Plaintext.AsSpan(offset, BlockSize).ToArray();
             byte[] transformed = encrypt ? xts.Encrypt(block, sector) : xts.Decrypt(block, sector);
             transformed.CopyTo(build.Plaintext, offset);
+            progress?.Report(new ProsperoBuildProgress("Encrypt", i + 1, build.BlockCount));
         }
     }
 
@@ -397,7 +404,8 @@ public static class ProsperoOuterPfsBuilder
     /// </summary>
     public static OuterPfsFileBuildResult BuildForPackageToFile(
         IReadOnlyList<OuterPfsFileSource> files, OuterPfsBuildParameters parameters,
-        string outputPath, bool encryptOutput, ReadOnlySpan<byte> tweakKey, ReadOnlySpan<byte> dataKey)
+        string outputPath, bool encryptOutput, ReadOnlySpan<byte> tweakKey, ReadOnlySpan<byte> dataKey,
+        IProgress<ProsperoBuildProgress>? progress = null)
     {
         ArgumentNullException.ThrowIfNull(files);
         ArgumentNullException.ThrowIfNull(parameters);
@@ -527,6 +535,7 @@ public static class ProsperoOuterPfsBuilder
         using (var xts = encryptOutput ? new AesXts(dataKey, tweakKey) : null)
         {
             outFs.SetLength(imageLength);
+            int processedBlocks = 0;
             for (int i = 0; i < files.Count; i++)
             {
                 OuterBlockKind kind = files[i].Signed ? OuterBlockKind.Signed : OuterBlockKind.Data;
@@ -541,6 +550,7 @@ public static class ProsperoOuterPfsBuilder
                     if (encryptOutput)
                         block = ApplyXts(xts!, block, kind, blockIndex);
                     outFs.Write(block, 0, BlockSize);
+                    progress?.Report(new ProsperoBuildProgress("Outer PFS", ++processedBlocks, dataBlockTotal));
                 }
             }
 

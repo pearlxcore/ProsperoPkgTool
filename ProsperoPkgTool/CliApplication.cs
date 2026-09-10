@@ -677,6 +677,7 @@ public static class CliApplication
         bool noPasscode = false;
         bool fakeSignModules = true;
         bool injectRightSprx = true;
+        bool verbose = false;
         for (int i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -696,6 +697,9 @@ public static class CliApplication
                     break;
                 case "--type" when i + 1 < args.Length:
                     requestedType = args[++i].ToLowerInvariant();
+                    break;
+                case "--verbose" or "-v":
+                    verbose = true;
                     break;
                 case "--compression" when i + 1 < args.Length:
                     compressionMode = args[++i].ToLowerInvariant() switch
@@ -723,9 +727,11 @@ public static class CliApplication
         }
         if (source is null || output is null)
         {
-            Console.Error.WriteLine("Usage: ProsperoPkgTool img_create <source-folder | project.gp5> --out <package.pkg> [--type base] [--compression stored|kraken] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--no_fself] [--no_right_sprx]");
+            Console.Error.WriteLine("Usage: ProsperoPkgTool img_create <source-folder | project.gp5> --out <package.pkg> [--type base] [--compression stored|kraken] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--no_fself] [--no_right_sprx] [--verbose]");
             return 2;
         }
+
+        var console = new ConsoleProgress(verbose);
 
         if (noPasscode)
         {
@@ -909,10 +915,11 @@ public static class CliApplication
         if (totalInnerBytes > FileBackedInnerImageThreshold)
             return RunInnerImageCreateFileBacked(
                 innerFiles, output, contentId, passcode, param, paramJson, compressionMode,
-                gp5PlayGo, sourceRoot, fullSource, manifestFiles, tsSec, tsNsec);
+                gp5PlayGo, sourceRoot, fullSource, manifestFiles, tsSec, tsNsec, console);
 
         var assembler = new ProsperoInnerImageAssembler(tsSec, tsNsec);
-        ProsperoInnerImageAssembler.InnerImageResult innerResult = assembler.Build(innerFiles, compressionMode);
+        ProsperoInnerImageAssembler.InnerImageResult innerResult = assembler.Build(innerFiles, compressionMode, console);
+        console.Finish();
         Console.WriteLine($"  Inner image: {innerResult.Image.Length} bytes, {innerResult.Ndblock} mount blocks, {innerResult.InodeCount} inodes");
         ProsperoCompressionMetrics compression = innerResult.CompressionMetrics;
         Console.WriteLine($"  Inner payload: {compression.RawBytes} raw -> {compression.EncodedBytes} encoded; " +
@@ -946,10 +953,11 @@ public static class CliApplication
             },
         };
         var outerParams = new OuterPfsBuildParameters { TimestampSeconds = tsSec, TimestampNanoseconds = tsNsec, Seed = outerSeed };
-        OuterPfsBuildResult outerBuild = ProsperoOuterPfsBuilder.BuildPlaintext(outerFiles, outerParams);
+        OuterPfsBuildResult outerBuild = ProsperoOuterPfsBuilder.BuildPlaintext(outerFiles, outerParams, console);
         (byte[] imageDigests, byte[] superblockIcv) = ProsperoOuterPfsBuilder.ComputeImageDigests(outerBuild);
         ProsperoOuterPfsBuilder.Encrypt(outerBuild, ProsperoKeys.DeriveOuterPfsXtsKeys(ekpfs, outerSeed).TweakKey,
-            ProsperoKeys.DeriveOuterPfsXtsKeys(ekpfs, outerSeed).DataKey);
+            ProsperoKeys.DeriveOuterPfsXtsKeys(ekpfs, outerSeed).DataKey, progress: console);
+        console.Finish();
         byte[] outerImage = outerBuild.Plaintext;
         byte[] pfsImageDigest = Sha3.Sha3_256(outerBuild.Plaintext.AsSpan(outerBuild.SuperblockIndex * ProsperoOuterPfsBuilder.BlockSize, ProsperoOuterPfsBuilder.BlockSize));
         Console.WriteLine($"  Outer PFS: {outerImage.Length} bytes, {outerBuild.BlockCount} blocks, superblock at block {outerBuild.SuperblockIndex}");
@@ -1127,7 +1135,7 @@ public static class CliApplication
         ProsperoInnerCompressionMode compressionMode,
         PlayGoProject? gp5PlayGo, string? sourceRoot, string fullSource,
         IReadOnlyList<Gp5ManifestFile>? manifestFiles,
-        long tsSec, uint tsNsec)
+        long tsSec, uint tsNsec, ConsoleProgress console)
     {
         string tempRoot = Path.Combine(Path.GetTempPath(), "libprospero-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(tempRoot);
@@ -1140,7 +1148,8 @@ public static class CliApplication
 
             var assembler = new ProsperoInnerImageAssembler(tsSec, tsNsec);
             ProsperoInnerImageAssembler.InnerImageResult innerResult =
-                assembler.BuildToFile(innerFiles, innerImagePath, compressionMode);
+                assembler.BuildToFile(innerFiles, innerImagePath, compressionMode, console);
+            console.Finish();
             Console.WriteLine($"  Inner image (file-backed): {innerResult.ImageSize} bytes, {innerResult.Ndblock} mount blocks, {innerResult.InodeCount} inodes");
             ProsperoCompressionMetrics compression = innerResult.CompressionMetrics;
             Console.WriteLine($"  Inner payload: {compression.RawBytes} raw -> {compression.EncodedBytes} encoded; " +
@@ -1173,7 +1182,8 @@ public static class CliApplication
             var outerParams = new OuterPfsBuildParameters { TimestampSeconds = tsSec, TimestampNanoseconds = tsNsec, Seed = outerSeed };
             (byte[] outerTweakKey, byte[] outerDataKey) = ProsperoKeys.DeriveOuterPfsXtsKeys(ekpfs, outerSeed);
             OuterPfsFileBuildResult outerBuild = ProsperoOuterPfsBuilder.BuildForPackageToFile(
-                outerSources, outerParams, outerPath, encryptOutput: true, outerTweakKey, outerDataKey);
+                outerSources, outerParams, outerPath, encryptOutput: true, outerTweakKey, outerDataKey, progress: console);
+            console.Finish();
             byte[] pfsImageDigest = Sha3.Sha3_256(outerBuild.SuperblockPlaintext);
             long outerLength = outerBuild.ImageLength;
             Console.WriteLine($"  Outer PFS (file-backed): {outerLength} bytes, {outerBuild.BlockCount} blocks, superblock at block {outerBuild.SuperblockIndex}");
@@ -1826,6 +1836,7 @@ public static class CliApplication
         string? referencePackage = null;
         bool noPasscode = false;
         bool mountMode = false;
+        bool verbose = false;
         for (int i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -1838,6 +1849,9 @@ public static class CliApplication
                     break;
                 case "--mount":
                     mountMode = true;
+                    break;
+                case "--verbose" or "-v":
+                    verbose = true;
                     break;
                 case "--tmp_path" when i + 1 < args.Length:
                     i++; // accepted for parity; temporary directory is unused
@@ -1861,9 +1875,11 @@ public static class CliApplication
             return 2;
         }
 
+        var console = new ConsoleProgress(verbose);
+
         if (ProsperoPackageReader.Read(package) is
             { Kind: ProsperoPackageKind.FinalizedDebug, Fih: { } fihLarge } && fihLarge.PfsSize > (1L << 31))
-            return RunInnerImageExtractFileBacked(package, selection, output, noPasscode ? null : passcode, mountMode);
+            return RunInnerImageExtractFileBacked(package, selection, output, noPasscode ? null : passcode, mountMode, console);
 
         ProsperoDecodedPackage decoded = ProsperoPackageContent.Read(package, noPasscode ? null : passcode, referencePackage);
         if (mountMode)
@@ -1907,13 +1923,15 @@ public static class CliApplication
             Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
             File.WriteAllBytes(destination, ProsperoInnerPfsReader.ReadFile(decoded.Mount, entry));
             written++;
+            console.Report(written, selected.Count, entry.Path);
         }
+        console.Finish();
         Console.WriteLine($"Extracted {written} file(s) to {output}");
         return 0;
     }
 
     private static int RunInnerImageExtractFileBacked(
-        string package, string? selection, string output, string? passcode, bool mountMode)
+        string package, string? selection, string output, string? passcode, bool mountMode, ConsoleProgress console)
     {
         using ProsperoFileBackedPackage fileBacked = ProsperoPackageContent.ReadFileBacked(package, passcode);
         if (mountMode)
@@ -1963,7 +1981,9 @@ public static class CliApplication
             using var fileDestination = File.Create(destination);
             ProsperoInnerPfsReader.ExtractFile(mount, entry, fileDestination);
             written++;
+            console.Report(written, selected.Count, entry.Path);
         }
+        console.Finish();
         Console.WriteLine($"Extracted {written} file(s) to {output}");
         return 0;
     }
@@ -2199,12 +2219,12 @@ public static class CliApplication
         Console.WriteLine("  img_file_list <pkg>     List logical inner-PFS paths; patches use --ref_pkg_path <base.pkg>");
         Console.WriteLine("  img_extract <pkg> <out> Extract logical files; patches use --ref_pkg_path <base.pkg>");
         Console.WriteLine("                          --mount writes the reconstructed mount image for diagnostics");
-        Console.WriteLine("                          [--passcode <passcode>|--no_passcode] [--tmp_path <dir>]");
+        Console.WriteLine("                          [--passcode <passcode>|--no_passcode] [--tmp_path <dir>] [--verbose]");
         Console.WriteLine("  img_verify <pkg>        Run available structural, CNT, PFS, NAPS, and inner-PFS checks");
         Console.WriteLine("  img_create <src> --out <pkg>  Build a debug base/application package");
         Console.WriteLine("                          <src> is a source folder or a project.gp5 manifest (manifest mode)");
         Console.WriteLine("                          [--gp5 <project.gp5>] [--compression stored|kraken]");
-        Console.WriteLine("                          [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--no_fself]");
+        Console.WriteLine("                          [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--no_fself] [--verbose]");
         Console.WriteLine("  convert <backup> --out <pkg>  Convert a decrypted backup into a debug base package");
         Console.WriteLine("                          Substitutes raw ELF modules from the decrypted subtree, fake-signs");
         Console.WriteLine("                          them, then reports module classification and launch-readiness");
