@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.IO.Compression;
 using System.Text;
+using System.Threading.Tasks;
 using ProsperoPkgTool.Compression;
 using ProsperoPkgTool.Crypto;
 
@@ -18,7 +19,7 @@ namespace ProsperoPkgTool.Containers;
 /// block-aligned; packed files are contiguous.
 ///
 /// Inner inode (0xA8 unsigned): mode@0(u16), nlink@2(u16), flags@4(u32), size@8(i64), sizeCompressed@0x10(i64),
-/// times@0x18..0x38 (4×i64 sec + 4×u32 nsec), logicalOffset@0x60(u64), db[0]@0x64=0, db[1]@0x68=afid/-1,
+/// times@0x18..0x38 (4×i64 sec + 4×u32 nsec), logicalOffset@0x60(u64), db[1]@0x68=afid/-1,
 /// db[2]@0x6c=parent_inode, db[3]@0x70=dirent_offset.
 /// </summary>
 public sealed class ProsperoInnerImageAssembler
@@ -26,7 +27,12 @@ public sealed class ProsperoInnerImageAssembler
     public const int BlockSize = 0x10000;
 
     private const string SceSysDir = "sce_sys";
-    private const long MetadataReserveBlocks = 61;
+    private const long MetadataReserveBlocks = 60;
+
+    // The reference layout packs inodes at BlockSize/InodeSize per 64 KiB block, leaving the
+    // remainder of each block unused. The writer must stay in lockstep with
+    // ProsperoInnerPfsReader, which reads inodes with the same packing.
+    private const int InodesPerBlock = BlockSize / 0xA8;
 
     private readonly long _timeSec;
     private readonly uint _timeNsec;
@@ -49,6 +55,12 @@ public sealed class ProsperoInnerImageAssembler
         /// <summary>Source file to read lazily when <see cref="Data"/> is not retained.</summary>
         public string? SourcePath { get; init; }
 
+        /// <summary>
+        /// Virtual payload provider, for callers that hold the source inside an image or archive
+        /// rather than on disk. Takes precedence over <see cref="SourcePath"/> and <see cref="Data"/>.
+        /// </summary>
+        public IProsperoFileSource? Source { get; init; }
+
         /// <summary>Source length when the payload is provided via <see cref="SourcePath"/>.</summary>
         public long Length { get; init; }
 
@@ -56,7 +68,9 @@ public sealed class ProsperoInnerImageAssembler
         public byte PlayGoChunkId { get; init; }
 
         /// <summary>Uncompressed payload length regardless of representation.</summary>
-        public long PayloadLength => SourcePath is not null ? Length : Data.LongLength;
+        public long PayloadLength => Source is not null
+            ? Source.Length
+            : SourcePath is not null ? Length : Data.LongLength;
     }
 
     /// <summary>The assembled inner image result.</summary>
@@ -112,8 +126,9 @@ public sealed class ProsperoInnerImageAssembler
             : new MemoryStream(Image, writable: false);
     }
 
-    /// <summary>One file's on-disk + logical placement (afid order), for NAPS/meta18 generation.</summary>
+    /// <summary>One file's on-disk + logical placement, for NAPS/meta18 generation.</summary>
     public readonly record struct Placement(
+        uint Afid,
         long OnDiskOffset,
         long LogicalOffset,
         long OnDiskSize,
@@ -146,9 +161,11 @@ public sealed class ProsperoInnerImageAssembler
     }
 
     /// <summary>Assemble the inner image from a flat list of files, returning its bytes.</summary>
+    /// <param name="krakenLevel">Kraken level recorded in the compressed metadata header (default 7).</param>
+    /// <param name="krakenThreads">Blocks encoded concurrently; 0 selects the processor count.</param>
     public InnerImageResult Build(IReadOnlyList<InnerFile> files, ProsperoInnerCompressionMode compressionMode = ProsperoInnerCompressionMode.Stored,
-        IProgress<ProsperoBuildProgress>? progress = null)
-        => BuildCore(files, compressionMode, null, progress);
+        IProgress<ProsperoBuildProgress>? progress = null, int krakenLevel = KrakenTuning.DefaultLevel, int krakenThreads = 0)
+        => BuildCore(files, compressionMode, null, progress, krakenLevel, krakenThreads);
 
     /// <summary>
     /// File-backed counterpart: the physical <c>pfs_image.dat</c> is written directly to
@@ -156,20 +173,23 @@ public sealed class ProsperoInnerImageAssembler
     /// may exceed the in-memory array limit. All geometry/metadata remains available in the result.
     /// </summary>
     public InnerImageResult BuildToFile(IReadOnlyList<InnerFile> files, string outputPath, ProsperoInnerCompressionMode compressionMode = ProsperoInnerCompressionMode.Stored,
-        IProgress<ProsperoBuildProgress>? progress = null)
+        IProgress<ProsperoBuildProgress>? progress = null, int krakenLevel = KrakenTuning.DefaultLevel, int krakenThreads = 0)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
         string full = Path.GetFullPath(outputPath);
         Directory.CreateDirectory(Path.GetDirectoryName(full) ?? Directory.GetCurrentDirectory());
-        return BuildCore(files, compressionMode, full, progress);
+        return BuildCore(files, compressionMode, full, progress, krakenLevel, krakenThreads);
     }
 
     private InnerImageResult BuildCore(IReadOnlyList<InnerFile> files, ProsperoInnerCompressionMode compressionMode, string? outputPath,
-        IProgress<ProsperoBuildProgress>? progress = null)
+        IProgress<ProsperoBuildProgress>? progress = null, int krakenLevel = KrakenTuning.DefaultLevel, int krakenThreads = 0)
     {
         ArgumentNullException.ThrowIfNull(files);
         if (files.Count == 0)
             throw new ArgumentException("At least one inner file is required.", nameof(files));
+
+        KrakenTuning.ValidateLevel(krakenLevel);
+        int krakenDegree = KrakenTuning.ResolveThreads(krakenThreads);
 
         // ---- 1. Build the directory tree. ----
         Dir uroot = BuildTree(files);
@@ -195,34 +215,68 @@ public sealed class ProsperoInnerImageAssembler
                 fileNodes.Add(f);
             }
 
-        // ---- 3. Assign afids (sce_sys first, then the rest). ----
+        // ---- 3. Assign afids (reference sparse scheme). ----
+        // sce_sys files first, ordered by system rank (keystone, executable module, data,
+        // pfs-version); the remaining files follow the interleaved directory-entry order.
         var afidOrder = new List<FileNode>();
         Dir? sceSys = uroot.SubDirs.FirstOrDefault(d => d.Name == SceSysDir);
-        if (sceSys != null) CollectFilesPreOrder(sceSys, afidOrder);
-        foreach (Dir d in dirsPreOrder)
-            if (d != sceSys && !IsUnder(d, sceSys))
-                foreach (FileNode f in d.Files.OrderBy(f => f.Name, StringComparer.Ordinal))
-                    afidOrder.Add(f);
-        for (uint a = 0; a < afidOrder.Count; a++)
-            afidOrder[(int)a].Afid = a;
-
-        // WholeBlockRaw depends only on the PlayGo chunk sequence; resolve it before placement so
-        // the alignment rules match the historical two-pass assembly exactly.
+        if (sceSys != null)
         {
-            byte? previousChunk = null;
-            foreach (FileNode f in afidOrder)
+            var sceFiles = new List<FileNode>();
+            CollectFilesPreOrder(sceSys, sceFiles);
+            afidOrder.AddRange(sceFiles.OrderBy(SystemAfidRank).ThenBy(f => f.FullPath, StringComparer.Ordinal));
+        }
+        CollectFilesEntryOrder(uroot, sceSys, afidOrder);
+
+        // Empty files carry no data: the reference excludes them from the afid slots and gives them
+        // one shared sentinel afid after the sparse table.
+        var emptyFiles = afidOrder.Where(f => f.PayloadLength == 0).ToList();
+        afidOrder.RemoveAll(f => f.PayloadLength == 0);
+
+        // Sparse slots: 28 files in the first 256 KiB data ublock, 30 in each later one; exceeding a
+        // slot inserts a 256 KiB hole (a null afid slot) and re-bases the logical cursor.
+        var afidSlots = new List<FileNode?>();
+        var afidOffsets = new List<long>();
+        long afidCursor = 0;
+        long afidUblock = -1;
+        int afidInUblock = 0;
+        foreach (FileNode f in afidOrder)
+        {
+            long ublock = afidCursor / (4 * BlockSize);
+            if (ublock != afidUblock) { afidUblock = ublock; afidInUblock = 0; }
+            if (afidInUblock >= (afidUblock == 0 ? 28 : 30))
             {
-                f.WholeBlockRaw = previousChunk.HasValue && previousChunk.Value != f.PlayGoChunkId;
-                previousChunk = f.PlayGoChunkId;
+                afidOffsets.Add(afidCursor);
+                afidSlots.Add(null);
+                afidCursor += 4 * BlockSize;
+                afidUblock = afidCursor / (4 * BlockSize);
+                afidInUblock = 0;
             }
+            f.Afid = (uint)afidSlots.Count;
+            f.LogicalOffset = afidCursor;
+            afidSlots.Add(f);
+            afidOffsets.Add(afidCursor);
+            afidCursor += f.PayloadLength;
+            afidInUblock++;
+        }
+        uint emptyAfid = (uint)(afidSlots.Count + emptyFiles.Count + 1);
+        foreach (FileNode f in emptyFiles) f.Afid = emptyAfid;
+
+        // Reference rule: keystone and executable modules are stored raw and occupy whole 64 KiB
+        // blocks because the console memory-maps them directly. PlayGo chunk transitions also anchor
+        // whole blocks so each chunk's physical extent begins on a 64 KiB boundary.
+        byte? previousChunk = null;
+        foreach (FileNode f in afidOrder)
+        {
+            bool chunkTransition = previousChunk.HasValue && previousChunk.Value != f.PlayGoChunkId;
+            previousChunk = f.PlayGoChunkId;
+            f.WholeBlockRaw = IsKeystone(f.FullPath) || IsExecutableModule(f) || chunkTransition;
         }
 
         // ---- 4. Logical offsets, encoded payload assembly and data placement. ----
         // Payloads are rendered one file at a time. The in-memory build retains them (as chunks);
         // the file-backed build writes each rendered payload straight to the image and keeps only
         // the encoded-block metadata, so peak memory is bounded by the largest single file.
-        long cursor = 0;
-        var afidOffsets = new long[afidOrder.Count];
         var encodedBlocks = new List<ProsperoEncodedBlock>();
         int sourceBlockIndex = 0;
         long pos = 0;
@@ -235,31 +289,34 @@ public sealed class ProsperoInnerImageAssembler
 
         foreach (FileNode f in afidOrder)
         {
-            f.LogicalOffset = cursor;
-            afidOffsets[f.Afid] = cursor;
-            cursor += f.PayloadLength;
-            f.StoreRaw = compressionMode == ProsperoInnerCompressionMode.Stored;
+            // Logical offsets and afids were resolved by the sparse slot assignment above.
+            f.StoreRaw = compressionMode == ProsperoInnerCompressionMode.Stored || f.WholeBlockRaw;
 
-            byte[] payload = RenderFilePayload(f, compressionMode, encodedBlocks, ref sourceBlockIndex,
-                retainEncodedBytes: outputPath is null);
-            f.EncodedLength = payload.Length;
-
+            // Alignment depends on the encoded length only for stored payloads, where it equals the
+            // uncompressed length; a compressed payload's only alignment trigger is WholeBlockRaw.
+            // Resolving the on-disk position before rendering keeps a single file larger than 2 GiB
+            // from ever being materialised as one byte[] on the file-backed path.
             bool alignBefore = f.WholeBlockRaw ||
-                (f.StoreRaw && pos % BlockSize != 0 && payload.Length > BlockSize - pos % BlockSize);
+                (f.StoreRaw && pos % BlockSize != 0 && f.PayloadLength > BlockSize - pos % BlockSize);
             if (alignBefore)
                 pos = RoundUp(pos, BlockSize);
             f.OnDiskOffset = pos;
 
+            long encodedLength;
             if (imageFs is not null)
             {
                 imageFs.Position = pos;
-                imageFs.Write(payload, 0, payload.Length);
+                encodedLength = RenderFilePayload(f, compressionMode, encodedBlocks, ref sourceBlockIndex,
+                    retainEncodedBytes: false, sink: imageFs, krakenThreads: krakenDegree, out _);
             }
             else
             {
-                imageChunks!.Add((pos, payload));
-                f.OnDiskData = payload;
+                encodedLength = RenderFilePayload(f, compressionMode, encodedBlocks, ref sourceBlockIndex,
+                    retainEncodedBytes: true, sink: null, krakenThreads: krakenDegree, out byte[]? payload);
+                imageChunks!.Add((pos, payload!));
+                f.OnDiskData = payload!;
             }
+            f.EncodedLength = encodedLength;
 
             long physical = pos;
             foreach (ProsperoEncodedBlock block in encodedBlocks.Where(b =>
@@ -269,7 +326,7 @@ public sealed class ProsperoInnerImageAssembler
                 physical += block.StoredLength;
             }
 
-            pos += payload.Length;
+            pos += encodedLength;
             if (f.WholeBlockRaw)
                 pos = RoundUp(pos, BlockSize);
 
@@ -279,44 +336,60 @@ public sealed class ProsperoInnerImageAssembler
         long dataEndLogical = afidOrder.Count > 0
             ? afidOrder.Max(f => f.LogicalOffset + f.PayloadLength)
             : 0;
-        long physicalDataBlocks = RoundUp(pos, BlockSize) / BlockSize;
-        long dataBlocks = physicalDataBlocks;
-        if (compressionMode != ProsperoInnerCompressionMode.Stored)
-        {
-            // The mount's logical address space must cover the UNCOMPRESSED payload, which can be
-            // far larger than the compressed physical block count. Basing the metadata region on the
-            // physical count places metaBase before the end of the logical data once compression
-            // savings exceed the ~4 MiB metadata reserve (observed at ~3.5 GiB scale), producing a
-            // non-monotonic fidx. Reserve after the logical data end, rounded to a 256 KiB ublock
-            // boundary. The stored layout (logical == physical) is preserved byte-for-byte.
-            long logicalDataBlocks = RoundUp(Math.Max(dataEndLogical, 1), 4 * BlockSize) / BlockSize;
-            dataBlocks = Math.Max(physicalDataBlocks, logicalDataBlocks);
-        }
+        // Empty files share the data-end boundary: the reference assigns every empty file the final
+        // logical cursor and excludes them from the afid placements.
+        foreach (FileNode f in emptyFiles) f.LogicalOffset = dataEndLogical;
+
+        // The metadata region starts 256 KiB-aligned after the logical data end plus the fixed
+        // 60-block reserve the reference uses. The physical on-disk data end never feeds the mount
+        // geometry, so compression cannot place metaBase behind the logical data.
+        long logicalDataBlocks = RoundUp(Math.Max(dataEndLogical, 1), 4 * BlockSize) / BlockSize;
 
         // ---- 5. Dirents. ----
         BuildDirents(uroot);
 
         // ---- 6. Metadata nodes + geometry. ----
-        int metadataContentBlocks = 1 + 3 + dirsPreOrder.Count + 1;
-        // metaBaseBlock = the block where the metadata region starts. The metadata plaintext spans
-        // 2 (superblock + inode table) + metadataContentBlocks blocks. ndblock = the mount's total
-        // block count = metaBaseBlock + 2 + metadataContentBlocks.
-        long metaBaseBlock = dataBlocks + MetadataReserveBlocks + 2;
-        long metaBase = metaBaseBlock * BlockSize;
-        long ndblock = metaBaseBlock + 2 + metadataContentBlocks;
+        // Serialize the metadata content blocks up front so their true on-disk geometry (a large
+        // directory may need several 64 KiB blocks) is known before node logical offsets are set.
+        List<byte[]> contentBlocks = BuildMetadataContent(dirsPreOrder, fileNodes, afidSlots,
+            inodeFltInode, aprFltInode, afidTableInode, uroot);
+        int nodeCount = 4 + dirsPreOrder.Count + fileNodes.Count;
+        int inodeBlockCount = (nodeCount + InodesPerBlock - 1) / InodesPerBlock;
+        int contentBlockCount = 0;
+        foreach (byte[] content in contentBlocks)
+            contentBlockCount += AllocatedBlocks(content.Length);
 
-        var nodes = BuildNodes(uroot, dirsPreOrder, fileNodes, metaBase);
+        // The reference format pads the metadata plaintext to an even block count: one empty 64 KiB
+        // block is appended only when the natural count is odd. The Sony fixture has an odd natural
+        // count (9 -> 10, padded); real large packages can be even (unpadded). The parameterised
+        // reader derives the metadata start as ndblock - plaintextBlocks, so both must agree here.
+        int naturalMetadataBlocks = 1 + inodeBlockCount + contentBlockCount;
+        if ((naturalMetadataBlocks & 1) != 0)
+            contentBlocks.Add([]);
+
+        // metaBaseBlock = the block where the metadata region starts. The metadata plaintext spans
+        // naturalMetadataBlocks (+ 1 when padded) blocks. ndblock = the mount's total block count.
+        long metaBaseBlock = logicalDataBlocks + MetadataReserveBlocks;
+        long metaBase = metaBaseBlock * BlockSize;
+        long ndblock = metaBaseBlock + naturalMetadataBlocks + (naturalMetadataBlocks & 1);
+
+        long[] contentOffsets = new long[contentBlocks.Count];
+        long contentCursor = metaBase + (1 + inodeBlockCount) * BlockSize;
+        for (int i = 0; i < contentBlocks.Count; i++)
+        {
+            contentOffsets[i] = contentCursor;
+            contentCursor += (long)AllocatedBlocks(contentBlocks[i].Length) * BlockSize;
+        }
+
+        var nodes = BuildNodes(uroot, dirsPreOrder, fileNodes, contentBlocks, contentOffsets);
 
         // ---- 7. Build metadata plaintext. ----
-        byte[] metaPlain = BuildMetadataPlaintext(nodes, dirsPreOrder, fileNodes, afidOrder, ndblock,
-            inodeFltInode, aprFltInode, afidTableInode, uroot);
+        byte[] metaPlain = BuildMetadataPlaintext(nodes, contentBlocks, inodeBlockCount, metaBaseBlock, ndblock);
 
         // ---- 8. Block-info table + stored metadata container. ----
-        long urootSize = 0;
-        foreach (FileNode f in afidOrder)
-            if (!f.FullPath.StartsWith("/sce_sys/", StringComparison.Ordinal))
-                urootSize += f.PayloadLength;
-        byte[] blockInfo = BuildBlockInfoTable(urootSize);
+        // The variable entry encodes the total afid data end (all files, sce_sys included):
+        // 0x27FFFC - 4*(afidDataEnd mod 64K), byte-swapped, exactly as the reference emits it.
+        byte[] blockInfo = BuildBlockInfoTable(dataEndLogical);
         pos = RoundUp(pos, BlockSize);
         long blockInfoOnDisk = pos;
         if (imageFs is not null)
@@ -336,12 +409,12 @@ public sealed class ProsperoInnerImageAssembler
         IReadOnlyList<ProsperoPfsv3Writer.CompressedBlock> metaBlocks;
         if (compressionMode == ProsperoInnerCompressionMode.Stored)
         {
-            compressedMeta = ProsperoPfsv3Writer.WriteStored(metaPlain);
+            compressedMeta = ProsperoPfsv3Writer.WriteStored(metaPlain, level: krakenLevel);
             metaBlocks = BuildStoredMetadataBlocks(metaPlain);
         }
         else
         {
-            (compressedMeta, metaBlocks) = ProsperoPfsv3Writer.WriteCompressed(metaPlain);
+            (compressedMeta, metaBlocks) = ProsperoPfsv3Writer.WriteCompressed(metaPlain, level: krakenLevel);
         }
         pos = RoundUp(pos, BlockSize);
         long metadataOnDisk = pos;
@@ -396,6 +469,7 @@ public sealed class ProsperoInnerImageAssembler
 
         // Placements in afid order for naps/meta18.
         var placements = afidOrder.Select(f => new Placement(
+            Afid: f.Afid,
             OnDiskOffset: f.OnDiskOffset,
             LogicalOffset: f.LogicalOffset,
             OnDiskSize: f.EncodedLength,
@@ -467,6 +541,7 @@ public sealed class ProsperoInnerImageAssembler
         public string FullPath = "";
         public byte[] Data = [];
         public string? SourcePath;
+        public IProsperoFileSource? Source;
         public long PayloadLength;
         public Dir Parent = null!;
         public uint Inode;
@@ -514,6 +589,7 @@ public sealed class ProsperoInnerImageAssembler
                 FullPath = "/" + path,
                 Data = f.Data,
                 SourcePath = f.SourcePath,
+                Source = f.Source,
                 PayloadLength = f.PayloadLength,
                 Parent = parent,
                 PlayGoChunkId = f.PlayGoChunkId,
@@ -551,6 +627,37 @@ public sealed class ProsperoInnerImageAssembler
             CollectFilesPreOrder(d, outList);
     }
 
+    /// <summary>
+    /// Reference order for the non-sce_sys files: at each directory the subdirectories and files are
+    /// merged and visited in name order, recursing into a directory where it sorts. The sce_sys
+    /// subtree is skipped entirely (its files are emitted first, by system rank).
+    /// </summary>
+    private static void CollectFilesEntryOrder(Dir directory, Dir? excludedSubtree, List<FileNode> outList)
+    {
+        var entries = directory.SubDirs
+            .Where(child => child != excludedSubtree && !IsUnder(child, excludedSubtree))
+            .Select(child => (Name: child.Name, Dir: (Dir?)child, File: (FileNode?)null))
+            .Concat(directory.Files.Select(file => (Name: file.Name, Dir: (Dir?)null, File: (FileNode?)file)))
+            .OrderBy(e => e.Name, StringComparer.Ordinal);
+        foreach (var entry in entries)
+        {
+            if (entry.File is not null) outList.Add(entry.File);
+            else if (entry.Dir is not null) CollectFilesEntryOrder(entry.Dir, excludedSubtree, outList);
+        }
+    }
+
+    /// <summary>
+    /// sce_sys afid ordering: keystone first, then executable modules, then other data, with
+    /// pfs-version.dat last.
+    /// </summary>
+    private static int SystemAfidRank(FileNode f)
+    {
+        if (IsKeystone(f.FullPath)) return 0;
+        if (IsExecutableModule(f)) return 1;
+        if (f.FullPath.Equals("/sce_sys/pfs-version.dat", StringComparison.Ordinal)) return 3;
+        return 2;
+    }
+
     private static bool IsUnder(Dir dir, Dir? ancestor)
     {
         if (ancestor == null) return false;
@@ -569,14 +676,14 @@ public sealed class ProsperoInnerImageAssembler
         return magic is 0x1D3D154F or 0xEEF51454 or 0x464C457F;
     }
 
-    /// <summary>Executable-module magic check for a node whose payload may be file-backed.</summary>
+    /// <summary>Executable-module magic check for a node whose payload may be file- or virtual-backed.</summary>
     private static bool IsExecutableModule(FileNode f)
     {
-        if (f.Data.Length >= 4 || f.SourcePath is null)
+        if (f.Data.Length >= 4 || (f.SourcePath is null && f.Source is null))
             return IsExecutableModule(f.Data.AsSpan());
 
         Span<byte> magic = stackalloc byte[4];
-        using var stream = new FileStream(f.SourcePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        using Stream stream = OpenSource(f);
         int read = 0;
         while (read < magic.Length)
         {
@@ -651,37 +758,38 @@ public sealed class ProsperoInnerImageAssembler
         public int DirentOffset = -1;
     }
 
-    private List<MetaNode> BuildNodes(Dir uroot, List<Dir> dirsPreOrder, List<FileNode> fileNodes, long metaBase)
+    private List<MetaNode> BuildNodes(Dir uroot, List<Dir> dirsPreOrder, List<FileNode> fileNodes,
+        IReadOnlyList<byte[]> contentBlocks, IReadOnlyList<long> contentOffsets)
     {
         var nodes = new List<MetaNode>();
-        // Content blocks start 2 blocks after the metadata region base (superblock + inode table).
-        long b = metaBase + 2 * BlockSize;
+        long BlockSizeOf(int index) => (long)AllocatedBlocks(contentBlocks[index].Length) * BlockSize;
 
         // inode 0: super-root directory.
-        nodes.Add(new MetaNode { Name = "", Inode = 0, IsDirectory = true, Mode = 0x416D, Nlink = 1, Flags = 0x00020010, Size = BlockSize, LogicalOffset = (ulong)b });
-        b += BlockSize;
+        nodes.Add(new MetaNode { Name = "", Inode = 0, IsDirectory = true, Mode = 0x416D, Nlink = 1, Flags = 0x00020010, Size = BlockSizeOf(0), LogicalOffset = (ulong)contentOffsets[0] });
         // inodes 1..3: internal metadata files.
-        nodes.Add(new MetaNode { Name = "inode_flat_path_table", Inode = 1, Mode = 0x816D, Nlink = 1, Flags = 0x00020010, LogicalOffset = (ulong)b }); b += BlockSize;
-        nodes.Add(new MetaNode { Name = "apr_flat_path_table", Inode = 2, Mode = 0x816D, Nlink = 1, Flags = 0x00020010, LogicalOffset = (ulong)b }); b += BlockSize;
-        nodes.Add(new MetaNode { Name = "afid_to_ino_table", Inode = 3, Mode = 0x816D, Nlink = 1, Flags = 0x00020010, LogicalOffset = (ulong)b }); b += BlockSize;
+        nodes.Add(new MetaNode { Name = "inode_flat_path_table", Inode = 1, Mode = 0x816D, Nlink = 1, Flags = 0x00020010, Size = contentBlocks[1].LongLength, LogicalOffset = (ulong)contentOffsets[1] });
+        nodes.Add(new MetaNode { Name = "apr_flat_path_table", Inode = 2, Mode = 0x816D, Nlink = 1, Flags = 0x00020010, Size = contentBlocks[2].LongLength, LogicalOffset = (ulong)contentOffsets[2] });
+        nodes.Add(new MetaNode { Name = "afid_to_ino_table", Inode = 3, Mode = 0x816D, Nlink = 1, Flags = 0x00020010, Size = contentBlocks[3].LongLength, LogicalOffset = (ulong)contentOffsets[3] });
         // inode 4+: uroot + sub-directories.
-        foreach (Dir d in dirsPreOrder)
+        for (int j = 0; j < dirsPreOrder.Count; j++)
         {
+            Dir d = dirsPreOrder[j];
             bool isUroot = d == uroot;
+            bool sceSysSubtree = !isUroot && (d.FullPath.Equals(SceSysDir, StringComparison.Ordinal) ||
+                d.FullPath.StartsWith(SceSysDir + "/", StringComparison.Ordinal));
             nodes.Add(new MetaNode
             {
                 Name = d.Name,
                 Inode = d.Inode,
                 IsDirectory = true,
-                Mode = (ushort)(isUroot ? 0x416D : 0x4168),
+                Mode = (ushort)(sceSysSubtree ? 0x4168 : 0x416D),
                 Nlink = (ushort)(2 + d.SubDirs.Count + (isUroot ? 1 : 0)),
-                Flags = (uint)(isUroot ? 0x00000010 : 0x00020010),
-                Size = BlockSize,
-                LogicalOffset = (ulong)b,
+                Flags = sceSysSubtree ? 0x00020010u : 0x00000010u,
+                Size = BlockSizeOf(4 + j),
+                LogicalOffset = (ulong)contentOffsets[4 + j],
                 ParentInode = isUroot ? -1 : (int)d.Parent!.Inode,
                 DirentOffset = isUroot ? -1 : d.DirentOffsetInParent,
             });
-            b += BlockSize;
         }
         // Regular files (inode order).
         foreach (FileNode f in fileNodes)
@@ -709,9 +817,13 @@ public sealed class ProsperoInnerImageAssembler
 
     // ---- Metadata plaintext ----
 
-    private byte[] BuildMetadataPlaintext(
-        List<MetaNode> nodes, List<Dir> dirsPreOrder, List<FileNode> fileNodes,
-        List<FileNode> afidOrder, long ndblock,
+    /// <summary>
+    /// Serializes the metadata content payloads in reference order:
+    /// [super-root dirents][inode_flat_path_table][apr_flat_path_table][afid_to_ino_table][dir dirents...].
+    /// The caller appends the even-parity padding block when the natural total is odd.
+    /// </summary>
+    private List<byte[]> BuildMetadataContent(
+        List<Dir> dirsPreOrder, List<FileNode> fileNodes, IReadOnlyList<FileNode?> afidSlots,
         uint inodeFltInode, uint aprFltInode, uint afidTableInode, Dir uroot)
     {
         // Flat-path tables.
@@ -719,8 +831,12 @@ public sealed class ProsperoInnerImageAssembler
         var aprFlt = new List<FlatPathEntry>();
         foreach (Dir d in dirsPreOrder)
             if (d != uroot)
+            {
+                bool sceSysSubtree = d.FullPath.Equals(SceSysDir, StringComparison.Ordinal) ||
+                    d.FullPath.StartsWith(SceSysDir + "/", StringComparison.Ordinal);
                 inodeFlt.Add(new FlatPathEntry(HashPath(d.FullPath),
-                    PackInodeEntry(d.Inode, true, false, 0)));
+                    PackInodeEntry(d.Inode, true, sceSysSubtree, 0)));
+            }
         foreach (FileNode f in fileNodes)
         {
             bool apr = !f.FullPath.StartsWith("/sce_sys/", StringComparison.Ordinal);
@@ -733,23 +849,15 @@ public sealed class ProsperoInnerImageAssembler
         byte[] inodeFltBytes = SerializeFlatPathTable(inodeFlt);
         byte[] aprFltBytes = SerializeFlatPathTable(aprFlt);
 
-        // afid_to_ino_table: [firstFileInode, inode per afid, -1, -1].
-        var afidList = new List<int> { (int)fileNodes.Min(f => f.Inode) };
-        foreach (FileNode f in afidOrder) afidList.Add((int)f.Inode);
+        // afid_to_ino_table: [slot count + 2, inode per afid slot (-1 for a hole), -1, -1].
+        var afidList = new List<int> { afidSlots.Count + 2 };
+        foreach (FileNode? slot in afidSlots)
+            afidList.Add(slot is null ? -1 : (int)slot.Inode);
         afidList.Add(-1); afidList.Add(-1);
         byte[] afidBytes = new byte[afidList.Count * 4];
         for (int i = 0; i < afidList.Count; i++)
             BinaryPrimitives.WriteInt32LittleEndian(afidBytes.AsSpan(i * 4), afidList[i]);
 
-        // Fill internal-file sizes.
-        foreach (MetaNode n in nodes)
-        {
-            if (n.Inode == inodeFltInode) n.Size = inodeFltBytes.Length;
-            else if (n.Inode == aprFltInode) n.Size = aprFltBytes.Length;
-            else if (n.Inode == afidTableInode) n.Size = afidBytes.Length;
-        }
-
-        // Metadata blocks: [super-root dirents][inode_flt][apr_flt][afid][dir dirents...][empty].
         var blocks = new List<byte[]>
         {
             SerializeDirents(SuperRootDirents(inodeFltInode, aprFltInode, afidTableInode, uroot.Inode)),
@@ -757,18 +865,37 @@ public sealed class ProsperoInnerImageAssembler
         };
         foreach (Dir d in dirsPreOrder)
             blocks.Add(SerializeDirents(d.Dirents));
-        blocks.Add([]);
+        return blocks;
+    }
 
-        // Assemble: superblock (block 0) + inode table (block 1) + content blocks.
-        int totalBlocks = 2 + blocks.Count;
+    private byte[] BuildMetadataPlaintext(
+        List<MetaNode> nodes, List<byte[]> contentBlocks, int inodeBlockCount,
+        long metaBaseBlock, long ndblock)
+    {
+        int contentBlockCount = 0;
+        foreach (byte[] content in contentBlocks)
+            contentBlockCount += AllocatedBlocks(content.Length);
+
+        // Assemble: superblock (block 0) + inode table (1..inodeBlockCount) + content blocks.
+        int totalBlocks = 1 + inodeBlockCount + contentBlockCount;
         byte[] metaPlain = new byte[totalBlocks * BlockSize];
-        BuildSuperblock(metaPlain.AsSpan(0, BlockSize), nodes.Count, ndblock, ndblock - totalBlocks + 1);
+        BuildSuperblock(metaPlain.AsSpan(0, BlockSize), nodes.Count, inodeBlockCount, ndblock, metaBaseBlock + 1);
         for (int i = 0; i < nodes.Count; i++)
-            WriteInode(metaPlain.AsSpan(BlockSize + i * 0xA8, 0xA8), nodes[i]);
-        for (int b = 0; b < blocks.Count; b++)
-            blocks[b].CopyTo(metaPlain.AsSpan((2 + b) * BlockSize));
+        {
+            int block = 1 + i / InodesPerBlock;
+            int within = i % InodesPerBlock;
+            WriteInode(metaPlain.AsSpan(block * BlockSize + within * 0xA8, 0xA8), nodes[i]);
+        }
+        long cursor = (long)(1 + inodeBlockCount) * BlockSize;
+        foreach (byte[] content in contentBlocks)
+        {
+            content.CopyTo(metaPlain.AsSpan((int)cursor));
+            cursor += (long)AllocatedBlocks(content.Length) * BlockSize;
+        }
         return metaPlain;
     }
+
+    private static int AllocatedBlocks(int length) => Math.Max(1, (length + BlockSize - 1) / BlockSize);
 
     private static IEnumerable<Dirent> SuperRootDirents(uint inodeFlt, uint aprFlt, uint afid, uint uroot) => new[]
     {
@@ -778,7 +905,7 @@ public sealed class ProsperoInnerImageAssembler
         new Dirent(uroot, DirentTypeDirectory, "uroot"),
     };
 
-    private void BuildSuperblock(Span<byte> sb, int inodeCount, long ndblock, long inodeTableBlock)
+    private void BuildSuperblock(Span<byte> sb, int inodeCount, int inodeBlockCount, long ndblock, long inodeTableBlock)
     {
         sb.Clear();
         BinaryPrimitives.WriteInt64LittleEndian(sb, 2);                        // version
@@ -789,7 +916,7 @@ public sealed class ProsperoInnerImageAssembler
         BinaryPrimitives.WriteInt64LittleEndian(sb[0x28..], 1);              // NBlock
         BinaryPrimitives.WriteInt64LittleEndian(sb[0x30..], inodeCount);     // DinodeCount
         BinaryPrimitives.WriteInt64LittleEndian(sb[0x38..], ndblock);        // Ndblock
-        BinaryPrimitives.WriteInt64LittleEndian(sb[0x40..], 1);              // DinodeBlockCount
+        BinaryPrimitives.WriteInt64LittleEndian(sb[0x40..], inodeBlockCount); // DinodeBlockCount
         BinaryPrimitives.WriteUInt32LittleEndian(sb[0x50..], BlockSize);
         BinaryPrimitives.WriteUInt32LittleEndian(sb[0x54..], 0x10);
         BinaryPrimitives.WriteUInt32LittleEndian(sb[0x58..], BlockSize);
@@ -812,7 +939,6 @@ public sealed class ProsperoInnerImageAssembler
         for (int t = 0; t < 4; t++) BinaryPrimitives.WriteInt64LittleEndian(dst[(0x18 + t * 8)..], _timeSec);
         for (int t = 0; t < 4; t++) BinaryPrimitives.WriteUInt32LittleEndian(dst[(0x38 + t * 4)..], _timeNsec);
         BinaryPrimitives.WriteUInt64LittleEndian(dst[0x60..], n.LogicalOffset);
-        BinaryPrimitives.WriteInt32LittleEndian(dst[0x64..], 0);
         int db1 = n.ParentInode < 0 ? -1 : (n.IsDirectory ? -1 : (int)n.Afid);
         BinaryPrimitives.WriteInt32LittleEndian(dst[0x68..], db1);
         BinaryPrimitives.WriteInt32LittleEndian(dst[0x6C..], n.ParentInode);
@@ -934,13 +1060,13 @@ public sealed class ProsperoInnerImageAssembler
 
     private const uint BlockInfoVersion = 0x00400003;
     private const uint BlockInfoTemplate = 0x00FCFF27;
-    private const uint BlockInfoBase = 0x0027373C;
+    private const uint BlockInfoBase = 0x0027FFFC;
 
     private static long RoundUp(long value, long granularity) => (value + granularity - 1) / granularity * granularity;
 
-    private static byte[] BuildBlockInfoTable(long urootFileSizeSum)
+    private static byte[] BuildBlockInfoTable(long afidDataEnd)
     {
-        uint sub = (uint)((4L * urootFileSizeSum) & 0xFFFFF);
+        uint sub = (uint)((afidDataEnd & 0xFFFF) * 4);
         uint bigEndian = (BlockInfoBase - sub) & 0xFFFFFF;
         uint value = ((bigEndian & 0xFF) << 16) | (bigEndian & 0xFF00) | ((bigEndian >> 16) & 0xFF);
         var table = new byte[32];
@@ -959,15 +1085,21 @@ public sealed class ProsperoInnerImageAssembler
 
     /// <summary>
     /// Renders one file's on-disk payload by reading its source in <see cref="KrakenEncoder.ChunkSize"/>
-    /// chunks (from memory or <see cref="FileNode.SourcePath"/>) and appending the per-chunk encoded
-    /// bytes. When <paramref name="retainEncodedBytes"/> is false (file-backed build) the block
-    /// records keep only their sizes/flags and leave <see cref="ProsperoEncodedBlock.EncodedBytes"/>
-    /// empty, so the returned payload is the only per-file copy.
+    /// chunks (from memory, a virtual provider, or <see cref="FileNode.SourcePath"/>) and emitting
+    /// the per-chunk encoded
+    /// bytes. When <paramref name="sink"/> is non-null the encoded bytes are streamed straight to it
+    /// (the file-backed build), so a file larger than 2 GiB never needs a single <c>byte[]</c>; the
+    /// payload is then returned only through the encoded length and <paramref name="payload"/> stays
+    /// null. When <paramref name="sink"/> is null the payload is buffered and returned. When
+    /// <paramref name="retainEncodedBytes"/> is false the block records keep only their sizes/flags
+    /// and leave <see cref="ProsperoEncodedBlock.EncodedBytes"/> empty.
     /// </summary>
-    private static byte[] RenderFilePayload(
+    private static long RenderFilePayload(
         FileNode f, ProsperoInnerCompressionMode compressionMode,
-        List<ProsperoEncodedBlock> encodedBlocks, ref int sourceBlockIndex, bool retainEncodedBytes)
+        List<ProsperoEncodedBlock> encodedBlocks, ref int sourceBlockIndex, bool retainEncodedBytes,
+        Stream? sink, int krakenThreads, out byte[]? payload)
     {
+        payload = null;
         if (f.PayloadLength == 0)
         {
             // An empty file still materializes as one zero-length stored block.
@@ -976,59 +1108,125 @@ public sealed class ProsperoInnerImageAssembler
                 SourceBlockIndex = sourceBlockIndex++, LogicalOffset = f.LogicalOffset,
                 UncompressedLength = 0, EncodedBytes = [], EncodedLength = 0, IsStored = true,
             });
-            return [];
+            payload = [];
+            return 0;
         }
 
-        var filePayload = new List<byte>();
+        List<byte>? filePayload = sink is null ? new List<byte>() : null;
         using Stream source = OpenSource(f);
-        var buffer = new byte[KrakenEncoder.ChunkSize];
         long remaining = f.PayloadLength;
         long blockOffset = 0;
-        while (remaining > 0)
+        long total = 0;
+        int degree = compressionMode == ProsperoInnerCompressionMode.Stored ? 1 : Math.Max(krakenThreads, 1);
+
+        if (degree <= 1)
         {
-            int rawLength = (int)Math.Min(KrakenEncoder.ChunkSize, remaining);
-            ReadExactly(source, buffer, rawLength);
-            ReadOnlySpan<byte> raw = buffer.AsSpan(0, rawLength);
-            // A terminal compressed block immediately before a NAPS RUN re-anchor has no
-            // independently serialized total-length field in the current reader contract.
-            // Keep that boundary stored; preceding blocks still use Kraken when beneficial.
-            bool terminalFileBlock = blockOffset + rawLength >= f.PayloadLength;
-            KrakenEncoder.EncodedBlock? kraken = compressionMode == ProsperoInnerCompressionMode.Stored || terminalFileBlock
-                ? null : KrakenEncoder.TryEncode(raw);
-            if (kraken is not null && VerifyKraken(raw, kraken))
+            var buffer = new byte[KrakenEncoder.ChunkSize];
+            while (remaining > 0)
             {
-                filePayload.AddRange(kraken.Payload);
-                encodedBlocks.Add(new ProsperoEncodedBlock
-                {
-                    SourceBlockIndex = sourceBlockIndex++, LogicalOffset = f.LogicalOffset + blockOffset,
-                    UncompressedLength = rawLength,
-                    EncodedBytes = retainEncodedBytes ? kraken.Payload : [],
-                    EncodedLength = kraken.Payload.Length, IsStored = false,
-                    KrakenMode = kraken.Mode, Flags = kraken.Flags,
-                    FirstChunkCompressedLength = kraken.FirstChunkCompressedLength,
-                });
+                int rawLength = (int)Math.Min(KrakenEncoder.ChunkSize, remaining);
+                ReadExactly(source, buffer, rawLength);
+                ReadOnlySpan<byte> raw = buffer.AsSpan(0, rawLength);
+                // A terminal compressed block immediately before a NAPS RUN re-anchor has no
+                // independently serialized total-length field in the current reader contract.
+                // Keep that boundary stored; preceding blocks still use Kraken when beneficial.
+                bool terminalFileBlock = blockOffset + rawLength >= f.PayloadLength;
+                KrakenEncoder.EncodedBlock? kraken = compressionMode == ProsperoInnerCompressionMode.Stored
+                    || f.StoreRaw || terminalFileBlock ? null : KrakenEncoder.TryEncodeNewLz(raw);
+                if (kraken is not null && VerifyKraken(raw, kraken))
+                    EmitKraken(kraken, rawLength, blockOffset, ref sourceBlockIndex);
+                else
+                    EmitStored(raw.ToArray(), rawLength, blockOffset, ref sourceBlockIndex);
+                remaining -= rawLength;
+                blockOffset += rawLength;
             }
-            else
-            {
-                byte[] stored = raw.ToArray();
-                filePayload.AddRange(stored);
-                encodedBlocks.Add(new ProsperoEncodedBlock
-                {
-                    SourceBlockIndex = sourceBlockIndex++, LogicalOffset = f.LogicalOffset + blockOffset,
-                    UncompressedLength = rawLength,
-                    EncodedBytes = retainEncodedBytes ? stored : [],
-                    EncodedLength = stored.Length, IsStored = true,
-                });
-            }
-            remaining -= rawLength;
-            blockOffset += rawLength;
         }
-        return filePayload.ToArray();
+        else
+        {
+            // The clean-room encoder carries no cross-block state, so independent chunks encode
+            // concurrently. Chunk i's terminal flag depends only on its own position, so the result
+            // is byte-identical to the sequential path regardless of the degree of parallelism.
+            int chunk = KrakenEncoder.ChunkSize;
+            while (remaining > 0)
+            {
+                int batchCount = (int)Math.Min(degree, (remaining + chunk - 1) / chunk);
+                var raws = new byte[batchCount][];
+                var lengths = new int[batchCount];
+                for (int i = 0; i < batchCount; i++)
+                {
+                    lengths[i] = (int)Math.Min(chunk, remaining - (long)i * chunk);
+                    raws[i] = new byte[lengths[i]];
+                    ReadExactly(source, raws[i], lengths[i]);
+                }
+
+                long batchStart = blockOffset;
+                var results = new (KrakenEncoder.EncodedBlock? Kraken, byte[]? Stored)[batchCount];
+                Parallel.For(0, batchCount, new ParallelOptions { MaxDegreeOfParallelism = degree }, i =>
+                {
+                    bool terminalFileBlock = batchStart + (long)i * chunk + lengths[i] >= f.PayloadLength;
+                    KrakenEncoder.EncodedBlock? kraken = f.StoreRaw || terminalFileBlock
+                        ? null : KrakenEncoder.TryEncodeNewLz(raws[i]);
+                    results[i] = kraken is not null && VerifyKraken(raws[i], kraken)
+                        ? (kraken, null)
+                        : (null, raws[i]);
+                });
+
+                for (int i = 0; i < batchCount; i++)
+                {
+                    long offset = batchStart + (long)i * chunk;
+                    if (results[i].Kraken is { } kraken)
+                        EmitKraken(kraken, lengths[i], offset, ref sourceBlockIndex);
+                    else
+                        EmitStored(results[i].Stored!, lengths[i], offset, ref sourceBlockIndex);
+                }
+
+                long consumed = 0;
+                for (int i = 0; i < batchCount; i++)
+                    consumed += lengths[i];
+                remaining -= consumed;
+                blockOffset += consumed;
+            }
+        }
+
+        payload = filePayload?.ToArray();
+        return total;
+
+        void EmitKraken(KrakenEncoder.EncodedBlock kraken, int rawLength, long offset, ref int sourceIndex)
+        {
+            sink?.Write(kraken.Payload, 0, kraken.Payload.Length);
+            filePayload?.AddRange(kraken.Payload);
+            total += kraken.Payload.Length;
+            encodedBlocks.Add(new ProsperoEncodedBlock
+            {
+                SourceBlockIndex = sourceIndex++, LogicalOffset = f.LogicalOffset + offset,
+                UncompressedLength = rawLength,
+                EncodedBytes = retainEncodedBytes ? kraken.Payload : [],
+                EncodedLength = kraken.Payload.Length, IsStored = false,
+                KrakenMode = kraken.Mode, Flags = kraken.Flags,
+                FirstChunkCompressedLength = kraken.FirstChunkCompressedLength,
+            });
+        }
+
+        void EmitStored(byte[] stored, int rawLength, long offset, ref int sourceIndex)
+        {
+            sink?.Write(stored, 0, stored.Length);
+            filePayload?.AddRange(stored);
+            total += stored.Length;
+            encodedBlocks.Add(new ProsperoEncodedBlock
+            {
+                SourceBlockIndex = sourceIndex++, LogicalOffset = f.LogicalOffset + offset,
+                UncompressedLength = rawLength,
+                EncodedBytes = retainEncodedBytes ? stored : [],
+                EncodedLength = stored.Length, IsStored = true,
+            });
+        }
     }
 
-    private static Stream OpenSource(FileNode f) => f.SourcePath is null
-        ? new MemoryStream(f.Data, writable: false)
-        : new FileStream(f.SourcePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
+    private static Stream OpenSource(FileNode f) => f.Source is not null
+        ? f.Source.Open()
+        : f.SourcePath is null
+            ? new MemoryStream(f.Data, writable: false)
+            : new FileStream(f.SourcePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
 
     private static void ReadExactly(Stream stream, byte[] buffer, int length)
     {

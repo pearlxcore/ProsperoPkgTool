@@ -48,7 +48,7 @@ public sealed class PackageBar : UserControl
         _recentPaths.AddRange(snapshot);
         _recents.Items.Clear();
         foreach (string path in snapshot)
-            _recents.Items.Add($"{Path.GetFileName(path)} — {path}");
+            _recents.Items.Add($"{Path.GetFileName(path)} - {path}");
     }
 
     private void BuildLayout()

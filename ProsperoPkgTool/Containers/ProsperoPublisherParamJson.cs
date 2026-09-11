@@ -64,6 +64,7 @@ public static class ProsperoPublisherParamJson
         root["sdkVersion"] = VersionText(sdkVersion);
         ulong required = Math.Max(Math.Min(HexVersion(root["requiredSystemSoftwareVersion"]), RequiredSystemSoftwareVersionCap), sdkVersion);
         root["requiredSystemSoftwareVersion"] = VersionText(required);
+        root["applicationCategoryType"] = 0;
         root["applicationDrmType"] ??= "standard";
         root["attribute"] ??= 0;
         root["attribute2"] ??= 0;

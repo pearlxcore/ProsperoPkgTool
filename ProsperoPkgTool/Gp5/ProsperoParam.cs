@@ -67,8 +67,11 @@ public static partial class ProsperoParamReader
             throw new InvalidDataException("param.json contentId must use the 36-character Sony content ID form.");
         if (!contentId.AsSpan(7, 9).Equals(titleId, StringComparison.Ordinal))
             throw new InvalidDataException("param.json contentId does not contain its titleId.");
-        if (category is not 0 and not 1)
-            throw new InvalidDataException("applicationCategoryType must be 0 (application) or 1 (additional content).");
+        // Real dumps carry publisher-specific category encodings (for example 0x01000000) that Sony's
+        // tooling overwrites with 0. Only 1 selects additional content; every other value is treated
+        // as a base application, matching the reference builder's CategoryTypeForMode.
+        if (category != 1)
+            category = 0;
         if (applicationDrmType is not null &&
             applicationDrmType is not "standard" and not "free" and not "freemium")
             throw new InvalidDataException("applicationDrmType must be standard, free, or freemium.");

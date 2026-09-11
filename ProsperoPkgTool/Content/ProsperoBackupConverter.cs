@@ -145,7 +145,8 @@ public static class ProsperoBackupConverter
     /// </summary>
     /// <exception cref="ArgumentException"><paramref name="options"/> or a required field is invalid.</exception>
     public static ProsperoBackupStagingResult Stage(
-        ProsperoBackupConversionOptions options, Action<string>? logger = null)
+        ProsperoBackupConversionOptions options, Action<string>? logger = null,
+        IProgress<ProsperoBuildProgress>? progress = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         var log = logger ?? (_ => { });
@@ -162,8 +163,6 @@ public static class ProsperoBackupConverter
 
         string decryptedRoot = Path.Combine(backup, options.DecryptedSubfolder);
         bool hasDecrypted = Directory.Exists(decryptedRoot);
-        if (!hasDecrypted)
-            warnings.Add($"No '{options.DecryptedSubfolder}' subtree was found; signed modules cannot be substituted and the package will not run.");
 
         ParamMeta paramMeta = ReadParamMeta(Path.Combine(backup, "sce_sys", "param.json"));
         string contentId = !string.IsNullOrWhiteSpace(options.ContentId) ? options.ContentId.Trim() : paramMeta.ContentId;
@@ -186,6 +185,14 @@ public static class ProsperoBackupConverter
             ? Path.Combine(options.OutputFolder, "." + SafeName(contentId) + ".convert.tmp")
             : Path.GetFullPath(options.StagingFolder);
 
+        // A staging folder that is the backup, the output folder, or a parent of either would be
+        // deleted before the copy and destroy user data (the backup itself in the worst case).
+        string outputFull = Path.GetFullPath(string.IsNullOrWhiteSpace(options.OutputFolder) ? "." : options.OutputFolder);
+        if (IsUnder(backup, staging) || IsUnder(outputFull, staging))
+            throw new ArgumentException(
+                "Staging folder must not be the backup/output folder or one of their parent directories.",
+                nameof(options));
+
         var substituted = new List<string>();
         var plaintext = new List<string>();
         var unresolved = new List<string>();
@@ -197,7 +204,7 @@ public static class ProsperoBackupConverter
         try
         {
             AssembleTree(backup, decryptedRoot, hasDecrypted, staging, options, log, warnings,
-                substituted, plaintext, unresolved);
+                substituted, plaintext, unresolved, progress);
         }
         catch
         {
@@ -237,14 +244,15 @@ public static class ProsperoBackupConverter
     public static ProsperoBackupConversionResult Convert(
         ProsperoBackupConversionOptions options,
         Func<ProsperoBackupStagingResult, string> build,
-        Action<string>? logger = null)
+        Action<string>? logger = null,
+        IProgress<ProsperoBuildProgress>? progress = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(build);
         var log = logger ?? (_ => { });
         var warnings = new List<string>();
 
-        ProsperoBackupStagingResult staging = Stage(options, log);
+        ProsperoBackupStagingResult staging = Stage(options, log, progress);
         warnings.AddRange(staging.Warnings);
 
         try
@@ -282,16 +290,24 @@ public static class ProsperoBackupConverter
     private static void AssembleTree(
         string backup, string decryptedRoot, bool hasDecrypted, string staging,
         ProsperoBackupConversionOptions options, Action<string> log, List<string> warnings,
-        List<string> substituted, List<string> plaintext, List<string> unresolved)
+        List<string> substituted, List<string> plaintext, List<string> unresolved,
+        IProgress<ProsperoBuildProgress>? progress)
     {
         string decryptedFull = hasDecrypted ? Path.GetFullPath(decryptedRoot) : "";
+        string[] files = Directory.GetFiles(backup, "*", SearchOption.AllDirectories);
 
-        foreach (string file in Directory.EnumerateFiles(backup, "*", SearchOption.AllDirectories))
+        for (int i = 0; i < files.Length; i++)
+        {
+            StageFile(files[i]);
+            progress?.Report(new ProsperoBuildProgress("Staging", i + 1, files.Length));
+        }
+
+        void StageFile(string file)
         {
             string full = Path.GetFullPath(file);
             // Skip the decrypted subtree itself; it is a source of substitutions, not a tree member.
             if (hasDecrypted && IsUnder(full, decryptedFull))
-                continue;
+                return;
 
             string rel = Path.GetRelativePath(backup, full);
             string relNorm = rel.Replace('\\', '/');
@@ -301,7 +317,7 @@ public static class ProsperoBackupConverter
                 && relNorm.Equals("sce_sys/about/right.sprx", StringComparison.OrdinalIgnoreCase))
             {
                 log("Dropping the backup right.sprx; the embedded debug module will be used.");
-                continue;
+                return;
             }
 
             string target = Path.Combine(staging, rel);
@@ -315,10 +331,10 @@ public static class ProsperoBackupConverter
                     // Already a raw ELF at its normal path; the build's fake-sign step converts it.
                     File.Copy(full, target, overwrite: true);
                     plaintext.Add(relNorm);
-                    continue;
+                    return;
                 }
 
-                if (magic == SelfMagic)
+                if (magic is SelfMagic or ProsperoSelfBuilder.LegacyOrbisMagic)
                 {
                     string? decrypted = hasDecrypted ? Path.Combine(decryptedRoot, rel) : null;
                     if (decrypted is not null && File.Exists(decrypted) && ReadMagic(decrypted) == ElfMagic)
@@ -326,7 +342,7 @@ public static class ProsperoBackupConverter
                         File.Copy(decrypted, target, overwrite: true);
                         substituted.Add(relNorm);
                         log($"Substituted decrypted module for {relNorm}.");
-                        continue;
+                        return;
                     }
 
                     File.Copy(full, target, overwrite: true);
@@ -342,7 +358,7 @@ public static class ProsperoBackupConverter
                         // Genuine signed module with no decrypted copy: pack it unchanged and flag it.
                         unresolved.Add(relNorm);
                     }
-                    continue;
+                    return;
                 }
             }
 

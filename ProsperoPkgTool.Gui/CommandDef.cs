@@ -9,6 +9,8 @@ public enum FieldKind
     MultiText,
     Combo,
     Check,
+    Numeric,
+    Slider,
 }
 
 public sealed class CommandField
@@ -21,6 +23,9 @@ public sealed class CommandField
     public string[]? ChoiceRemarks { get; init; }
     public string Default { get; init; } = string.Empty;
     public string Hint { get; init; } = string.Empty;
+    public int Minimum { get; init; }
+    public int Maximum { get; init; }
+    public int Increment { get; init; } = 1;
 }
 
 public sealed class CommandDef

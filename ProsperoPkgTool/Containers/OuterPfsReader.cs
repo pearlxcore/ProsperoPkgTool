@@ -55,10 +55,16 @@ public sealed class OuterPfsReader
     }
 
     /// <summary>
-    /// Locate the plaintext superblock within the outer PFS image and read the seed.
-    /// The superblock is identified by the little-endian i64 value 20130315 at offset 0x08.
+    /// Locate the plaintext superblock within the outer PFS image and read the seed. The
+    /// superblock is identified by the little-endian i64 value 20130315 at offset 0x08.
     /// </summary>
-    public static OuterPfsReader Open(Stream stream, long pfsOffset, long pfsSize)
+    /// <param name="superblockIndexHint">
+    /// Optional block index of the plaintext superblock, when the caller can derive it from the
+    /// FIH header. Supplying it avoids the full linear scan (and read) of a multi-GB outer image.
+    /// The hint is validated against the magic; when it is wrong or absent the reader falls back
+    /// to the full scan, preserving correctness for foreign layouts.
+    /// </param>
+    public static OuterPfsReader Open(Stream stream, long pfsOffset, long pfsSize, int superblockIndexHint = -1)
     {
         ArgumentNullException.ThrowIfNull(stream);
         if (pfsOffset < 0 || pfsSize < BlockSize)
@@ -66,6 +72,15 @@ public sealed class OuterPfsReader
 
         int blockCount = (int)(pfsSize / BlockSize);
         byte[] block = new byte[BlockSize];
+        if (superblockIndexHint >= 0 && superblockIndexHint < blockCount)
+        {
+            ReadBlockRaw(stream, pfsOffset, superblockIndexHint, block);
+            if (BinaryPrimitives.ReadInt64LittleEndian(block.AsSpan(0x08, 8)) == SuperblockMagic)
+            {
+                byte[] seed = block.AsSpan(SuperblockSeedOffset, 16).ToArray();
+                return new OuterPfsReader(stream, pfsOffset, pfsSize, superblockIndexHint, (byte[])block.Clone(), seed);
+            }
+        }
         for (int i = 0; i < blockCount; i++)
         {
             ReadBlockRaw(stream, pfsOffset, i, block);
@@ -268,6 +283,20 @@ public sealed class OuterPfsReader
                 IndirectBlocks = ReadBlockSigs32(e.Slice(S32IndirectBlockOffset, 5 * BlockSig32Stride), 5),
             };
         }
+        // A wrong passcode decrypts the signed inode table to garbage. Detect an implausible uroot
+        // inode (index 2) here so callers get a passcode-oriented message instead of a low-level
+        // block-resolution failure further down.
+        if (inodes.Length <= 2)
+            throw new InvalidDataException("The outer PFS inode table is missing its uroot inode.");
+        S32Inode uroot = inodes[2];
+        if ((uroot.Mode & 0xF000) != 0x4000 || uroot.Size <= 0 ||
+            uroot.Size > (long)BlockCount * BlockSize || uroot.Blocks == 0 || uroot.Blocks > (uint)BlockCount)
+        {
+            throw new InvalidDataException(
+                "The outer PFS inode table did not decrypt to a valid uroot directory: the passcode is " +
+                "likely wrong, or the package is corrupt.");
+        }
+
         return inodes;
     }
 
@@ -303,8 +332,10 @@ public sealed class OuterPfsReader
     /// </summary>
     private int[] ResolveBlocks(AesXts xts, S32Inode inode)
     {
-        if (inode.Blocks > int.MaxValue)
-            throw new InvalidDataException("Inode block count exceeds the addressable range.");
+        if (inode.Blocks > (uint)Math.Max(0, BlockCount))
+            throw new InvalidDataException(
+                $"Outer inode declares {inode.Blocks} blocks, more than the image's {BlockCount} blocks: " +
+                "the passcode is likely wrong, or the package is corrupt.");
         int blocks = (int)inode.Blocks;
         if (blocks < 0)
             throw new InvalidDataException("Inode block count is negative.");
@@ -319,7 +350,14 @@ public sealed class OuterPfsReader
             if (root <= 0)
                 continue;
             ProsperoOuterPfsBuilder.CollectIndirectTree(root, level + 1, blocks,
-                blockIndex => ReadBlock(xts, checked((int)blockIndex), signed: true), result);
+                blockIndex =>
+                {
+                    if (blockIndex < 0 || blockIndex >= BlockCount)
+                        throw new InvalidDataException(
+                            "An outer inode references an out-of-range metadata block: the passcode is " +
+                            "likely wrong, or the package is corrupt.");
+                    return ReadBlock(xts, (int)blockIndex, signed: true);
+                }, result);
         }
 
         if (result.Count < blocks)

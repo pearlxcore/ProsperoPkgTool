@@ -376,12 +376,12 @@ public sealed class ProsperoCntBuilder
     /// name table, digests placeholder). The metas/name-table/digests payloads are placeholders
     /// filled during <see cref="Build"/>.
     /// </summary>
-    public static List<Entry> BuildStandardEntries(string contentId, string passcode, byte[] ekpfs)
+    public static List<Entry> BuildStandardEntries(string contentId, string passcode, byte[] ekpfs, bool deterministicEntryKeys = false)
     {
         return
         [
-            new Entry { Id = CntEntryId.EntryKeys, Name = null, Data = ProsperoRsaKeys.BuildEntryKeysEntry(contentId, passcode), Flags1 = 0x60000000 },
-            new Entry { Id = CntEntryId.ImageKey, Name = null, Data = ProsperoRsaKeys.BuildImageKeyEntry(ekpfs), Flags1 = 0x60000000 },
+            new Entry { Id = CntEntryId.EntryKeys, Name = null, Data = ProsperoRsaKeys.BuildEntryKeysEntry(contentId, passcode, deterministicEntryKeys), Flags1 = 0x60000000 },
+            new Entry { Id = CntEntryId.ImageKey, Name = null, Data = ProsperoRsaKeys.BuildImageKeyEntry(ekpfs, deterministicEntryKeys), Flags1 = 0x60000000 },
             new Entry { Id = CntEntryId.GeneralDigests, Name = null, Data = new byte[0x1E0], Flags1 = 0x60000000 },
             new Entry { Id = CntEntryId.Metas, Name = null, Data = new byte[0], Flags1 = 0x60000000 },
             new Entry { Id = CntEntryId.Digests, Name = null, Data = new byte[0], Flags1 = 0x40000000 },

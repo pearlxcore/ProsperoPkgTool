@@ -107,7 +107,7 @@ public static class ProsperoLaunchReadiness
             return new ModuleLaunchReadiness(path, ModuleAuthorityKind.RawElf, 0, true,
                 "Raw ELF module; the build fake-signs it, so it starts on a debug-mode console.");
 
-        if (magic == SelfMagic)
+        if (magic is SelfMagic or ProsperoSelfBuilder.LegacyOrbisMagic)
             return ClassifySelf(path, data);
 
         return new ModuleLaunchReadiness(path, ModuleAuthorityKind.NotExecutable, 0, false,

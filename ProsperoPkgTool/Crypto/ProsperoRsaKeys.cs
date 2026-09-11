@@ -82,9 +82,10 @@ public static class ProsperoRsaKeys
     /// <summary>
     /// Builds the 0x800-byte CNT IMAGE_KEY entry (id 0x0020): back-to-back RSA-PKCS#1 wraps of the
     /// 32-byte EKPFS under the mount-image modulus. 5 whole 384-byte wraps + the first 128 bytes of
-    /// a 6th wrap (= 2048 bytes total).
+    /// a 6th wrap (= 2048 bytes total). When <paramref name="deterministic"/> is set the wraps use
+    /// <see cref="RsaPkcs1EncryptDeterministic"/>, making the entry (and the package) reproducible.
     /// </summary>
-    public static byte[] BuildImageKeyEntry(ReadOnlySpan<byte> ekpfs)
+    public static byte[] BuildImageKeyEntry(ReadOnlySpan<byte> ekpfs, bool deterministic = false)
     {
         if (ekpfs.Length != 32)
             throw new ArgumentException("EKPFS must be 32 bytes.", nameof(ekpfs));
@@ -93,7 +94,9 @@ public static class ProsperoRsaKeys
         int off = 0;
         while (off < ImageKeyEntrySize)
         {
-            byte[] wrap = RsaPkcs1Encrypt(MountImageModulus, ekpfs);
+            byte[] wrap = deterministic
+                ? RsaPkcs1EncryptDeterministic(MountImageModulus, ekpfs)
+                : RsaPkcs1Encrypt(MountImageModulus, ekpfs);
             int take = Math.Min(ModulusSize, ImageKeyEntrySize - off);
             wrap.AsSpan(0, take).CopyTo(entry.AsSpan(off));
             off += take;
@@ -105,9 +108,10 @@ public static class ProsperoRsaKeys
     /// Builds the CNT ENTRY_KEYS entry (id 0x0010, 2944 bytes): a 32-byte seed digest (SHA3-256 of
     /// the content id padded to 48 bytes), seven 32-byte per-key digests, then seven 384-byte
     /// RSA-wrapped passcode keys. Index 0 wraps the raw passcode ASCII; indices 1..6 wrap the
-    /// SHA3-derived package keys.
+    /// SHA3-derived package keys. When <paramref name="deterministic"/> is set the wraps use
+    /// <see cref="RsaPkcs1EncryptDeterministic"/>, making the entry (and the package) reproducible.
     /// </summary>
-    public static byte[] BuildEntryKeysEntry(string contentId, string passcode)
+    public static byte[] BuildEntryKeysEntry(string contentId, string passcode, bool deterministic = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(contentId);
         ArgumentException.ThrowIfNullOrWhiteSpace(passcode);
@@ -144,7 +148,9 @@ public static class ProsperoRsaKeys
                 ? Encoding.ASCII.GetBytes(passcode)
                 : ProsperoKeys.ComputeKeys(contentId, passcode, (uint)i, useSha3: true);
 
-            byte[] wrap = RsaPkcs1Encrypt(GetPasscodeModulus(i), key);
+            byte[] wrap = deterministic
+                ? RsaPkcs1EncryptDeterministic(GetPasscodeModulus(i), key)
+                : RsaPkcs1Encrypt(GetPasscodeModulus(i), key);
             wrap.CopyTo(entry.AsSpan(off));
             off += ModulusSize;
         }

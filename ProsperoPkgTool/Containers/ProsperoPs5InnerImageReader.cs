@@ -259,6 +259,98 @@ public static class ProsperoPs5InnerImageReader
     }
 
     /// <summary>
+    /// Decode one inner-image block to its uncompressed bytes on demand, so callers can
+    /// random-access the inner mount without reconstructing the whole (possibly multi-GB) image.
+    /// Raw blocks are served straight from the compressed stream, Kraken blocks via
+    /// <see cref="KrakenDecoder"/>, dedup aliases by replaying their source block, and zero holes
+    /// as zeros.
+    /// </summary>
+    public static byte[] DecodeBlock(
+        IReadOnlyList<InnerBlock> blocks, int index,
+        Func<long, int, byte[]> readInnerImage, long innerImageLength)
+    {
+        ArgumentNullException.ThrowIfNull(blocks);
+        ArgumentNullException.ThrowIfNull(readInnerImage);
+        return DecodeBlock(blocks, index, readInnerImage, innerImageLength, depth: 0);
+    }
+
+    private static byte[] DecodeBlock(
+        IReadOnlyList<InnerBlock> blocks, int index,
+        Func<long, int, byte[]> readInnerImage, long innerImageLength, int depth)
+    {
+        if (index < 0 || index >= blocks.Count)
+            throw new ArgumentOutOfRangeException(nameof(index));
+        if (depth > 32)
+            throw new InvalidDataException("NAPS dedup alias chain is too deep to resolve.");
+
+        InnerBlock b = blocks[index];
+        int length = b.UncompressedLength;
+        var buffer = new byte[length];
+        if (length == 0 || b.IsZeroHole)
+            return buffer;
+
+        if (b.IsAlias)
+        {
+            if (b.SourceBlockIndex < 0 || b.SourceBlockIndex >= blocks.Count)
+                return buffer;
+            InnerBlock source = blocks[b.SourceBlockIndex];
+            int copy = Math.Min(length, source.UncompressedLength);
+            if (copy > 0)
+            {
+                byte[] decoded = DecodeBlock(blocks, b.SourceBlockIndex, readInnerImage, innerImageLength, depth + 1);
+                Array.Copy(decoded, 0, buffer, 0, copy);
+            }
+            return buffer;
+        }
+
+        if (!b.IsKraken)
+        {
+            if (b.CompressedOffset < 0 || b.CompressedLength < length ||
+                b.CompressedOffset + length > innerImageLength)
+                throw new InvalidDataException(
+                    $"Stored NAPS block at logical 0x{b.UncompressedOffset:X} reads outside pfs_image.dat (source 0x{b.CompressedOffset:X}, length 0x{length:X}).");
+            byte[] plain = readInnerImage(b.CompressedOffset, length);
+            if (plain.Length < length)
+                throw new InvalidDataException(
+                    $"Stored NAPS block at logical 0x{b.UncompressedOffset:X} returned only 0x{plain.Length:X} of 0x{length:X} bytes.");
+            return plain.Length == length ? plain : plain[..length];
+        }
+
+        if (b.CompressedOffset < 0 || b.CompressedLength <= 0 ||
+            b.CompressedOffset + b.CompressedLength > innerImageLength)
+            throw new InvalidDataException(
+                $"Kraken NAPS block at logical 0x{b.UncompressedOffset:X} has invalid source range 0x{b.CompressedOffset:X}+0x{b.CompressedLength:X}.");
+
+        byte[] compressed = readInnerImage(b.CompressedOffset, b.CompressedLength);
+        bool multiChunk = length > Chunk128K;
+        int firstChunkComp = multiChunk ? b.EvenCompressedLength : 0;
+        foreach (int flags in FlagCandidates(multiChunk, b.KrakenFlags))
+        {
+            KrakenDecoder.KrakenDecodeStatus status;
+            try { status = KrakenDecoder.DecodeBlock(compressed, flags, firstChunkComp, buffer); }
+            catch { continue; }
+            if (status == KrakenDecoder.KrakenDecodeStatus.Success)
+                return buffer;
+        }
+        throw new InvalidDataException(
+            $"Kraken decode failed for NAPS block at logical 0x{b.UncompressedOffset:X}, source 0x{b.CompressedOffset:X}+0x{b.CompressedLength:X}, KDE unknown.");
+    }
+
+    /// <summary>
+    /// Decode every block and discard the bytes, validating that all stored/Kraken/alias blocks
+    /// resolve — the verification counterpart of <see cref="ReconstructMountToFile"/> that never
+    /// writes a multi-GB temp mount.
+    /// </summary>
+    public static void DecodeAllBlocks(
+        IReadOnlyList<InnerBlock> blocks, Func<long, int, byte[]> readInnerImage, long innerImageLength)
+    {
+        ArgumentNullException.ThrowIfNull(blocks);
+        ArgumentNullException.ThrowIfNull(readInnerImage);
+        for (int i = 0; i < blocks.Count; i++)
+            DecodeBlock(blocks, i, readInnerImage, innerImageLength, depth: 0);
+    }
+
+    /// <summary>
     /// File-backed counterpart of <see cref="ReconstructMount(byte[], byte[])"/>: writes the
     /// uncompressed mount to <paramref name="outputPath"/> one block at a time, so a multi-GB
     /// inner image needs neither a whole <c>byte[]</c> source nor destination.

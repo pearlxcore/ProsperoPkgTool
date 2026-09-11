@@ -165,11 +165,20 @@ public static class ProsperoPlayGoChunkBuilder
     }
 
     private static List<PhysicalLeaf> BuildPhysicalLeaves(ProsperoInnerImageAssembler.InnerImageResult inner,
-        IReadOnlyDictionary<string, byte> assignments) => inner.Nodes.Where(n => !n.IsDirectory && n.FullPath.Length != 0)
-        .Select(n => new PhysicalLeaf(inner.Placements[checked((int)n.Afid)].OnDiskOffset,
-            inner.Placements[checked((int)n.Afid)].OnDiskSize,
-            assignments.TryGetValue(ProsperoPlayGoRecordBuilder.NormalizePath(n.FullPath), out byte id) ? id : (byte)0))
-        .ToList();
+        IReadOnlyDictionary<string, byte> assignments)
+    {
+        // Afids are sparse (holes) and empty files share a sentinel afid, so map by afid rather
+        // than indexing the compact placement list; only byte-backed leaves carry a placement.
+        var byAfid = inner.Placements.ToDictionary(p => p.Afid);
+        return inner.Nodes.Where(n => !n.IsDirectory && n.FullPath.Length != 0 && n.Size > 0)
+            .Select(n =>
+            {
+                ProsperoInnerImageAssembler.Placement placement = byAfid[n.Afid];
+                return new PhysicalLeaf(placement.OnDiskOffset, placement.OnDiskSize,
+                    assignments.TryGetValue(ProsperoPlayGoRecordBuilder.NormalizePath(n.FullPath), out byte id) ? id : (byte)0);
+            })
+            .ToList();
+    }
 
     private static Dictionary<string, byte> NormalizeAssignments(ProsperoInnerImageAssembler.InnerImageResult inner,
         IReadOnlyDictionary<string, byte>? assignments, int chunkCount)

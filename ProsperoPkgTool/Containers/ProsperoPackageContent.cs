@@ -15,43 +15,78 @@ public sealed record ProsperoDecodedPackage(
     bool OuterPfsIcvValid);
 
 /// <summary>
-/// File-backed decode result for multi-GB packages: the uncompressed mount is reconstructed to a
-/// temporary file and enumerated with 64-bit offsets, so neither the inner image nor the mount is
-/// materialized as a single <c>byte[]</c>. Callers own disposal of the temp mount.
+/// Lazy, file-backed decode result for multi-GB packages: the outer PFS is opened once and the
+/// inner mount is served on demand through <see cref="ProsperoInnerMountStream"/>. Neither the
+/// inner image nor the mount is materialized as a single <c>byte[]</c>, and no temporary mount
+/// file is written. <see cref="Entries"/> is enumerated from the inner-PFS metadata only, so it
+/// never reads the file data. Callers own disposal, which releases the package stream.
 /// </summary>
 public sealed class ProsperoFileBackedPackage : IDisposable
 {
-    public required ProsperoPackageInspection Inspection { get; init; }
-    public required byte[] Naps { get; init; }
-    public required IReadOnlyList<ProsperoPs5InnerImageReader.InnerBlock> Blocks { get; init; }
-    public required long InnerImageLength { get; init; }
-    public required long MountLength { get; init; }
-    public required string MountPath { get; init; }
-    public required bool OuterPfsIcvValid { get; init; }
-    public required IReadOnlyList<ProsperoInnerPfsReader.Entry> Entries { get; init; }
+    private readonly FileStream _stream;
+    private readonly AesXts _xts;
+    private readonly Func<long, int, byte[]> _readRegion;
 
-    public Stream OpenMount() => File.OpenRead(MountPath);
+    internal ProsperoFileBackedPackage(
+        ProsperoPackageInspection inspection,
+        byte[] naps,
+        IReadOnlyList<ProsperoPs5InnerImageReader.InnerBlock> blocks,
+        long innerImageLength,
+        long mountLength,
+        bool outerPfsIcvValid,
+        IReadOnlyList<ProsperoInnerPfsReader.Entry> entries,
+        FileStream stream,
+        AesXts xts,
+        Func<long, int, byte[]> readRegion)
+    {
+        Inspection = inspection;
+        Naps = naps;
+        Blocks = blocks;
+        InnerImageLength = innerImageLength;
+        MountLength = mountLength;
+        OuterPfsIcvValid = outerPfsIcvValid;
+        Entries = entries;
+        _stream = stream;
+        _xts = xts;
+        _readRegion = readRegion;
+    }
+
+    public ProsperoPackageInspection Inspection { get; }
+    public byte[] Naps { get; }
+    public IReadOnlyList<ProsperoPs5InnerImageReader.InnerBlock> Blocks { get; }
+    public long InnerImageLength { get; }
+    public long MountLength { get; }
+    public bool OuterPfsIcvValid { get; }
+    public IReadOnlyList<ProsperoInnerPfsReader.Entry> Entries { get; }
+
+    /// <summary>Open a fresh lazy view of the reconstructed inner mount.</summary>
+    public Stream OpenMount() => new ProsperoInnerMountStream(Blocks, InnerImageLength, _readRegion);
+
+    /// <summary>Decrypt and return an arbitrary <c>pfs_image.dat</c> region on demand.</summary>
+    public byte[] ReadInnerImageRegion(long offset, int length) => _readRegion(offset, length);
+
+    /// <summary>Decode every block (discarding the bytes) to validate the whole image.</summary>
+    public void DecodeAllBlocks() =>
+        ProsperoPs5InnerImageReader.DecodeAllBlocks(Blocks, _readRegion, InnerImageLength);
 
     public void Dispose()
     {
-        try
-        {
-            if (File.Exists(MountPath))
-                File.Delete(MountPath);
-        }
-        catch (IOException) { }
-        catch (UnauthorizedAccessException) { }
+        _xts.Dispose();
+        _stream.Dispose();
     }
 }
 
 public static class ProsperoPackageContent
 {
     /// <summary>
-    /// Decode a finalized-debug package without a whole-image <c>byte[]</c>: stream the inner image
-    /// from the outer PFS, reconstruct the mount to a temp file, and enumerate it. The caller must
-    /// dispose the result to delete the temp mount.
+    /// Decode a finalized-debug package lazily: open the outer PFS once (using the FIH superblock
+    /// hint so a multi-GB image is not scanned linearly) and serve the inner mount on demand. No
+    /// temporary mount file is written, and enumerating the result touches only the inner-PFS
+    /// metadata blocks, so listing or summarising a multi-GB package is fast. The caller must
+    /// dispose the result to release the package stream.
     /// </summary>
-    public static ProsperoFileBackedPackage ReadFileBacked(string packagePath, string? passcode = null)
+    public static ProsperoFileBackedPackage ReadFileBacked(string packagePath, string? passcode = null,
+        bool repairTruncatedOffsets = false)
     {
         ProsperoPackageInspection inspection = ProsperoPackageReader.Read(packagePath);
         if (inspection.Fih is not { } fih)
@@ -61,47 +96,80 @@ public static class ProsperoPackageContent
         if (inspection.Cnt.ContentId.Length != 36)
             throw new InvalidDataException("The package CNT has no usable content ID for outer-PFS key derivation.");
 
-        string mountPath = Path.Combine(Path.GetTempPath(), "ProsperoPkgTool-mount-" + Guid.NewGuid().ToString("N") + ".bin");
+        var stream = new FileStream(Path.GetFullPath(packagePath), FileMode.Open, FileAccess.Read, FileShare.Read);
         try
         {
-            using var stream = File.OpenRead(Path.GetFullPath(packagePath));
-            OuterPfsReader pfs = OuterPfsReader.Open(stream, checked((long)fih.PfsOffset), checked((long)fih.PfsSize));
+            long pfsOffset = checked((long)fih.PfsOffset);
+            long pfsSize = checked((long)fih.PfsSize);
+            OuterPfsReader pfs = OuterPfsReader.Open(stream, pfsOffset, pfsSize,
+                ReadOuterSuperblockIndexHint(stream, pfsSize));
             byte[] ekpfs = ProsperoKeys.ComputeEkpfs(inspection.Cnt.ContentId,
                 passcode ?? Gp5.Gp5Constants.DefaultPasscode);
             (byte[] tweak, byte[] data) = ProsperoKeys.DeriveOuterPfsXtsKeys(ekpfs, pfs.Seed);
-            using var xts = new AesXts(data, tweak);
-
-            byte[] naps = pfs.ReadNaps(xts);
-            long innerLength = pfs.InnerImageLength;
-            IReadOnlyList<ProsperoPs5InnerImageReader.InnerBlock> blocks =
-                ProsperoPs5InnerImageReader.WalkBlocks(naps, innerLength);
-            ProsperoPs5InnerImageReader.ReconstructMountToFile(
-                blocks, innerLength, (offset, length) => pfs.ReadInnerImageRegion(xts, offset, length), mountPath);
-
-            IReadOnlyList<ProsperoInnerPfsReader.Entry> entries;
-            using (var mountStream = File.OpenRead(mountPath))
-                entries = ProsperoInnerPfsReader.Enumerate(mountStream);
-            long mountLength = new FileInfo(mountPath).Length;
-            bool icv = pfs.VerifySuperblockIcv();
-
-            return new ProsperoFileBackedPackage
+            var xts = new AesXts(data, tweak);
+            try
             {
-                Inspection = inspection,
-                Naps = naps,
-                Blocks = blocks,
-                InnerImageLength = innerLength,
-                MountLength = mountLength,
-                MountPath = mountPath,
-                OuterPfsIcvValid = icv,
-                Entries = entries,
-            };
+                byte[] naps = pfs.ReadNaps(xts);
+                long innerLength = pfs.InnerImageLength;
+                IReadOnlyList<ProsperoPs5InnerImageReader.InnerBlock> blocks =
+                    ProsperoPs5InnerImageReader.WalkBlocks(naps, innerLength);
+                long mountLength = ProsperoPs5InnerImageReader.MountSize(blocks);
+
+                byte[] ReadRegion(long offset, int length) => pfs.ReadInnerImageRegion(xts, offset, length);
+
+                IReadOnlyList<ProsperoInnerPfsReader.Entry> entries;
+                using (var mount = new ProsperoInnerMountStream(blocks, innerLength, ReadRegion))
+                    entries = ProsperoInnerPfsReader.Enumerate(mount, ReadInnerSuperblockHint(stream), repairTruncatedOffsets);
+
+                return new ProsperoFileBackedPackage(
+                    inspection, naps, blocks, innerLength, mountLength, pfs.VerifySuperblockIcv(), entries,
+                    stream, xts, ReadRegion);
+            }
+            catch
+            {
+                xts.Dispose();
+                throw;
+            }
         }
         catch
         {
-            try { if (File.Exists(mountPath)) File.Delete(mountPath); }
-            catch (IOException) { }
+            stream.Dispose();
             throw;
         }
+    }
+
+    /// <summary>
+    /// Derive the outer-PFS superblock block index from the FIH header field at 0x20
+    /// (<c>0x10000 + superblockOffset</c>), or -1 when it is absent/implausible. The hint only
+    /// speeds up <see cref="OuterPfsReader.Open"/>; a wrong hint falls back to a full scan.
+    /// </summary>
+    private static int ReadOuterSuperblockIndexHint(Stream stream, long pfsSize)
+    {
+        Span<byte> header = stackalloc byte[0x60];
+        stream.Position = 0;
+        stream.ReadExactly(header);
+        ulong field = BinaryPrimitives.ReadUInt64LittleEndian(header.Slice(0x20, 8));
+        if (field < OuterPfsReader.BlockSize)
+            return -1;
+        long offset = (long)field - OuterPfsReader.BlockSize;
+        if (offset % OuterPfsReader.BlockSize != 0)
+            return -1;
+        long index = offset / OuterPfsReader.BlockSize;
+        int blockCount = (int)(pfsSize / OuterPfsReader.BlockSize);
+        return index >= 0 && index < blockCount ? (int)index : -1;
+    }
+
+    /// <summary>
+    /// Derive the inner-PFS superblock logical mount offset from the FIH metadata-base field at
+    /// 0x50 (a 64 KiB block count), or -1 when absent. A wrong/absent hint falls back to a scan.
+    /// </summary>
+    private static long ReadInnerSuperblockHint(Stream stream)
+    {
+        Span<byte> header = stackalloc byte[0x58];
+        stream.Position = 0;
+        stream.ReadExactly(header);
+        ulong blocks = BinaryPrimitives.ReadUInt64LittleEndian(header.Slice(0x50, 8));
+        return blocks > 0 ? (long)blocks * ProsperoInnerPfsReader.BlockSize : -1;
     }
 
     public static ProsperoDecodedPackage Read(string packagePath, string? passcode = null, string? referencePackagePath = null)
@@ -282,7 +350,7 @@ public static class ProsperoPackageVerifier
         bool si = ProsperoPackageContent.TryOpenSi(packagePath, inspection, out string? siError);
         checks.Add(new("SI consistency", si ? VerificationState.Pass : inspection.Segments.Any(s => s.Name == "SI" && s.Size > 0) ? VerificationState.Fail : VerificationState.NotPresent,
             si ? "Stored SI ZIP is readable" : siError ?? "No SI segment"));
-        checks.Add(new("FIH digest", VerificationState.Unavailable, "No independently proven FIH digest verifier"));
+        checks.Add(VerifyFihDigest(packagePath, inspection));
         checks.Add(new("RSA signature", VerificationState.Unavailable, "Public-key signature verification is not independently implemented"));
 
         try
@@ -295,6 +363,9 @@ public static class ProsperoPackageVerifier
             if (large)
             {
                 using ProsperoFileBackedPackage fileBacked = ProsperoPackageContent.ReadFileBacked(packagePath, passcode);
+                // Verification keeps its full decode pass (validating every stored/Kraken block) but
+                // streams it on demand instead of reconstructing a multi-GB temp mount.
+                fileBacked.DecodeAllBlocks();
                 AddDecodedChecks(checks, fileBacked.Blocks, fileBacked.Entries, fileBacked.OuterPfsIcvValid,
                     ProsperoPackageKind.FinalizedDebug);
             }
@@ -331,6 +402,40 @@ public static class ProsperoPackageVerifier
         checks.Add(new("Inner PFS structural integrity", VerificationState.Pass, $"{entries.Count} logical entries"));
         checks.Add(new("PFS block hashes/digests", VerificationState.Unavailable, "Per-block foreign-layout verifier not implemented"));
         checks.Add(new("PlayGo CRC", VerificationState.Unavailable, "No independently proven CRC location/verifier"));
+    }
+
+    /// <summary>
+    /// The FIH carries the SHA3-256 of the plaintext outer-PFS superblock block, mirrored at 0x30,
+    /// 0x70 and 0xD0. Both the digest and the superblock are stored unencrypted, so this check is
+    /// independent of the package passcode and works on foreign (Sony-built) images.
+    /// </summary>
+    private static VerificationCheck VerifyFihDigest(string packagePath, ProsperoPackageInspection inspection)
+    {
+        if (inspection.Fih is not { } fih || fih.PfsSize < OuterPfsReader.BlockSize)
+            return new("FIH digest", VerificationState.Unavailable, "No usable FIH outer-PFS region");
+        try
+        {
+            long fihOffset = inspection.Lih is { } lih ? (long)lih.FihOffset : 0;
+            using var fs = File.OpenRead(packagePath);
+            byte[] header = new byte[0x100];
+            fs.Position = fihOffset;
+            fs.ReadExactly(header);
+            byte[] expected = header.AsSpan(0x30, 32).ToArray();
+            bool mirrored = header.AsSpan(0x70, 32).SequenceEqual(expected) && header.AsSpan(0xD0, 32).SequenceEqual(expected);
+            OuterPfsReader pfs = OuterPfsReader.Open(fs, (long)fih.PfsOffset, (long)fih.PfsSize);
+            byte[] superblock = new byte[OuterPfsReader.BlockSize];
+            fs.Position = (long)fih.PfsOffset + (long)pfs.SuperblockIndex * OuterPfsReader.BlockSize;
+            fs.ReadExactly(superblock);
+            bool matches = Sha3.Sha3_256(superblock).AsSpan().SequenceEqual(expected);
+            return matches && mirrored
+                ? new("FIH digest", VerificationState.Pass, "FIH game digest = SHA3-256(plaintext outer-PFS superblock)")
+                : new("FIH digest", VerificationState.Fail,
+                    !matches ? "FIH game digest does not match SHA3-256(outer-PFS superblock)" : "FIH digest mirrors at 0x70/0xD0 disagree");
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException)
+        {
+            return new("FIH digest", VerificationState.Unavailable, ex.Message);
+        }
     }
 
     private static void VerifyCnt(string packagePath, ProsperoPackageInspection inspection, List<VerificationCheck> checks)

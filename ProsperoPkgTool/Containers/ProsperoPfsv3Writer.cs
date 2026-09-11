@@ -50,7 +50,7 @@ public static class ProsperoPfsv3Writer
     private const uint Magic = 0x43534650;     // 'PFSC' (little-endian)
     private const uint EncodeParam0C = 0x0802; // v3 / Kraken / 256 KiB / window 18
     private const int KrakenAlgorithm = 2;
-    private const int DefaultLevel = 7;
+    private const int DefaultLevel = Compression.KrakenTuning.DefaultLevel;
     private const int WindowBits = 18;
 
     // Stored-block boundary-table flags (id=3, bits 48..55 of the first u64).
@@ -95,9 +95,12 @@ public static class ProsperoPfsv3Writer
     /// </summary>
     /// <param name="payload">The uncompressed data to wrap.</param>
     /// <param name="blockSize">The logical block size (default 256 KiB). Must be positive.</param>
-    public static byte[] WriteStored(ReadOnlySpan<byte> payload, int blockSize = DefaultBlockSize)
+    /// <param name="level">Kraken level recorded in the container header (default 7). Blocks are stored verbatim.</param>
+    public static byte[] WriteStored(ReadOnlySpan<byte> payload, int blockSize = DefaultBlockSize,
+        int level = DefaultLevel)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(blockSize);
+        Compression.KrakenTuning.ValidateLevel(level);
 
         int blockCount = payload.Length == 0 ? 1 : (payload.Length + blockSize - 1) / blockSize;
 
@@ -126,12 +129,11 @@ public static class ProsperoPfsv3Writer
         BinaryPrimitives.WriteUInt32LittleEndian(span[0x08..], (uint)blockSize);
         BinaryPrimitives.WriteUInt32LittleEndian(span[0x0C..], EncodeParam0C);
         ulong encodeParam10 = (ulong)KrakenAlgorithm
-                              | ((ulong)DefaultLevel << 8)
+                              | ((ulong)(byte)level << 8)
                               | ((ulong)WindowBits << 16);
         BinaryPrimitives.WriteUInt64LittleEndian(span[0x10..], encodeParam10);
         BinaryPrimitives.WriteUInt64LittleEndian(span[0x18..], (ulong)payload.Length);
         BinaryPrimitives.WriteUInt64LittleEndian(span[0x20..], (ulong)totalSize);
-        // span[0x28..0x48] file digest — filled in last.
 
         // ---- section directory @0x48 (ids 1..7) ----
         WriteDirectoryEntry(span, 0, 1, off1, sec1Size);
@@ -200,16 +202,17 @@ public static class ProsperoPfsv3Writer
     /// </summary>
     /// <param name="payload">The uncompressed data to wrap.</param>
     /// <param name="blockSize">The logical block size (default 256 KiB). Must be positive.</param>
+    /// <param name="level">Kraken level recorded in the container header (default 7).</param>
     public static (byte[] Container, IReadOnlyList<CompressedBlock> Blocks) WriteCompressed(
-        ReadOnlySpan<byte> payload, int blockSize = DefaultBlockSize)
+        ReadOnlySpan<byte> payload, int blockSize = DefaultBlockSize, int level = DefaultLevel)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(blockSize);
+        Compression.KrakenTuning.ValidateLevel(level);
 
         int blockCount = payload.Length == 0 ? 1 : (payload.Length + blockSize - 1) / blockSize;
         var encoded = new byte[blockCount][];
         var info = new CompressedBlock[blockCount];
         var compressed = new bool[blockCount];
-        long compressedTotal = 0;
         long plainOffset = 0;
         for (int i = 0; i < blockCount; i++)
         {
@@ -231,9 +234,12 @@ public static class ProsperoPfsv3Writer
                 encoded[i] = block.ToArray();
                 info[i] = new CompressedBlock(plainSize, plainSize, false, 0, 0);
             }
-            compressedTotal += encoded[i].Length;
             plainOffset += plainSize;
         }
+
+        long compressedTotal = 0;
+        for (int i = 0; i < blockCount; i++)
+            compressedTotal += encoded[i].Length;
 
         int sec1Size = GitHash.Length;
         int sec2Size = ShuffleTable.Length;
@@ -259,7 +265,7 @@ public static class ProsperoPfsv3Writer
         BinaryPrimitives.WriteUInt32LittleEndian(span[0x08..], (uint)blockSize);
         BinaryPrimitives.WriteUInt32LittleEndian(span[0x0C..], EncodeParam0C);
         ulong encodeParam10 = (ulong)KrakenAlgorithm
-                              | ((ulong)DefaultLevel << 8)
+                              | ((ulong)(byte)level << 8)
                               | ((ulong)WindowBits << 16);
         BinaryPrimitives.WriteUInt64LittleEndian(span[0x10..], encodeParam10);
         BinaryPrimitives.WriteUInt64LittleEndian(span[0x18..], (ulong)payload.Length);

@@ -11,14 +11,34 @@ public sealed record PlayGoScenario(
     int InitialChunkCount,
     IReadOnlyList<int> Chunks);
 
+/// <summary>One ownership extent declared by a PlayGo chunk: a 64-KiB-aligned <c>[Start, Start+Length)</c> range.</summary>
+public sealed record PlayGoExtent(int ChunkId, ulong Start, ulong Length);
+
+/// <summary>
+/// One per-file PlayGo assignment from the hash table + FICM pair. <see cref="Path"/> is the
+/// normalized inner-image relative path when the caller supplied a hash-to-path map, else null.
+/// </summary>
+public sealed record PlayGoAssignment(ulong PathHash, int ChunkId, string? Path);
+
 public sealed class PlayGoProject
 {
     public ushort VersionMajor { get; init; }
     public ushort VersionMinor { get; init; }
     public string ContentId { get; init; } = string.Empty;
     public int DefaultScenarioId { get; init; }
+
+    /// <summary>Header flags word at 0x1C. Treated as opaque: debug/nwonly output uses 0x85.</summary>
+    public uint HeaderFlags { get; init; }
+
     public IReadOnlyList<PlayGoChunk> Chunks { get; init; } = [];
     public IReadOnlyList<PlayGoScenario> Scenarios { get; init; } = [];
+
+    /// <summary>Chunk ownership extents in chunk/record order (the 0xC8 extent-id lists into 0xD8).</summary>
+    public IReadOnlyList<PlayGoExtent> Extents { get; init; } = [];
+
+    /// <summary>Per-file chunk assignments from the hash table + FICM, when supplied to <see cref="PlayGoChunkReader"/>.</summary>
+    public IReadOnlyList<PlayGoAssignment> Assignments { get; init; } = [];
+
     /// <summary>
     /// Explicit clean-room mapping of normalized inner-PFS file paths to chunk IDs. Entries not
     /// present here use chunk zero in the debug/nwonly source-folder model.
@@ -32,6 +52,10 @@ public static class PlayGoChunkReader
     private const uint PlgxMagic = 0x78676C70;
     private const int HeaderSize = 0x100;
     private const int AttributeSize = 0x20;
+    private const int ExtentSize = 0x10;
+    private const int HashTableHeaderSize = 0x38;
+    private const int HashTableCountOffset = 0x24;
+    private const int FicmHeaderSize = 0x10;
 
     public static PlayGoProject Read(string path)
     {
@@ -53,6 +77,7 @@ public static class PlayGoChunkReader
         int scenarioCount = U16(data, 0x0E);
         uint declaredSize = U32(data, 0x10);
         int defaultScenario = U16(data, 0x14);
+        uint headerFlags = U32(data, 0x1C);
 
         if (declaredSize < HeaderSize || declaredSize > data.Length)
             throw new InvalidDataException("playgo-chunk.dat declared file_size is outside the file.");
@@ -67,14 +92,22 @@ public static class PlayGoChunkReader
             throw new InvalidDataException("PlayGo default scenario ID is outside the scenario table.");
 
         Section chunkAttrs = ReadSection(data, 0xC0, "chunk attributes");
+        Section chunkExtentIds = ReadSection(data, 0xC8, "chunk extent ids");
         Section chunkLabels = ReadSection(data, 0xD0, "chunk labels");
+        Section extents = ReadSection(data, 0xD8, "extents");
         Section scenarioAttrs = ReadSection(data, 0xE0, "scenario attributes");
         Section scenarioChunks = ReadSection(data, 0xE8, "scenario chunks");
         Section scenarioLabels = ReadSection(data, 0xF0, "scenario labels");
         RequireCapacity(chunkAttrs, chunkCount, AttributeSize, "chunk attributes");
         RequireCapacity(scenarioAttrs, scenarioCount, AttributeSize, "scenario attributes");
+        if (extents.Size % ExtentSize != 0)
+            throw new InvalidDataException("PlayGo extent section is not a multiple of 16 bytes.");
+        if (chunkExtentIds.Size % sizeof(uint) != 0)
+            throw new InvalidDataException("PlayGo chunk extent-id list is not a multiple of 4 bytes.");
+        int extentCount = extents.Size / ExtentSize;
 
         var chunks = new List<PlayGoChunk>(chunkCount);
+        var projectExtents = new List<PlayGoExtent>();
         for (int index = 0; index < chunkCount; index++)
         {
             int at = checked(chunkAttrs.Offset + index * AttributeSize);
@@ -82,6 +115,22 @@ public static class PlayGoChunkReader
             uint labelOffset = U32(data, at + 0x1C);
             string label = ReadLabel(data, chunkLabels, labelOffset, $"chunk {index}");
             chunks.Add(new PlayGoChunk(index, label, languageMask));
+
+            int extentIdCount = checked((int)U32(data, at + 0x04));
+            int extentListOffset = checked((int)U32(data, at + 0x18));
+            if (extentIdCount < 0 || extentListOffset < 0 ||
+                (long)extentListOffset + (long)extentIdCount * sizeof(uint) > chunkExtentIds.Size)
+            {
+                throw new InvalidDataException($"PlayGo chunk {index} extent-id list is outside its section.");
+            }
+            for (int extent = 0; extent < extentIdCount; extent++)
+            {
+                int id = checked((int)U32(data, checked(chunkExtentIds.Offset + extentListOffset + extent * sizeof(uint))));
+                if (id < 0 || id >= extentCount)
+                    throw new InvalidDataException($"PlayGo chunk {index} references undefined extent {id}.");
+                int extentAt = checked(extents.Offset + id * ExtentSize);
+                projectExtents.Add(new PlayGoExtent(index, U64(data, extentAt), U64(data, extentAt + 8)));
+            }
         }
 
         var scenarios = new List<PlayGoScenario>(scenarioCount);
@@ -121,9 +170,71 @@ public static class PlayGoChunkReader
             VersionMinor = versionMinor,
             ContentId = ReadFixedAscii(data.Slice(0x40, 128)),
             DefaultScenarioId = defaultScenario,
+            HeaderFlags = headerFlags,
             Chunks = chunks,
             Scenarios = scenarios,
+            Extents = projectExtents,
         };
+    }
+
+    /// <summary>
+    /// Reads a PLGX descriptor plus its <c>playgo-hash-table.dat</c> and <c>playgo-ficm.dat</c>
+    /// companions, attaching the resolved per-file chunk assignments.
+    /// </summary>
+    public static PlayGoProject Read(ReadOnlySpan<byte> data, ReadOnlySpan<byte> hashTable, ReadOnlySpan<byte> ficm,
+        IReadOnlyDictionary<ulong, string>? pathByHash = null)
+    {
+        PlayGoProject project = Read(data);
+        IReadOnlyList<PlayGoAssignment> assignments = ReadAssignments(hashTable, ficm, pathByHash);
+        return new PlayGoProject
+        {
+            VersionMajor = project.VersionMajor,
+            VersionMinor = project.VersionMinor,
+            ContentId = project.ContentId,
+            DefaultScenarioId = project.DefaultScenarioId,
+            HeaderFlags = project.HeaderFlags,
+            Chunks = project.Chunks,
+            Scenarios = project.Scenarios,
+            Extents = project.Extents,
+            Assignments = assignments,
+            FileChunkAssignments = project.FileChunkAssignments,
+        };
+    }
+
+    /// <summary>
+    /// Resolves the per-file chunk ids from the 0x38 hash table and the FICM, optionally mapping
+    /// each 64-bit path hash to a path. The hash is the inner-image relative path (no leading
+    /// slash) through <see cref="Containers.ProsperoOuterPfsBuilder.FltPathHash"/>.
+    /// </summary>
+    public static IReadOnlyList<PlayGoAssignment> ReadAssignments(ReadOnlySpan<byte> hashTable,
+        ReadOnlySpan<byte> ficm, IReadOnlyDictionary<ulong, string>? pathByHash = null)
+    {
+        if (hashTable.Length < HashTableHeaderSize)
+            throw new InvalidDataException("playgo-hash-table.dat is shorter than its 0x38-byte header.");
+        int count = checked((int)U32(hashTable, HashTableCountOffset));
+        if (count < 0 || (long)HashTableHeaderSize + (long)count * sizeof(ulong) > hashTable.Length)
+            throw new InvalidDataException("PlayGo hash table is shorter than its declared count.");
+
+        if (ficm.Length < FicmHeaderSize)
+            throw new InvalidDataException("playgo-ficm.dat is shorter than its 0x10-byte header.");
+        // The FICM carries a byte length at 0x0C (count * 2); when present it must agree with the
+        // hash-table count. Fall back to the hash-table count when it is absent.
+        uint declared = U32(ficm, 0x0C);
+        if (declared != 0 && (declared % sizeof(ushort) != 0 || declared / sizeof(ushort) != (uint)count))
+            throw new InvalidDataException("PlayGo FICM count disagrees with the hash table.");
+        if ((long)FicmHeaderSize + (long)count * sizeof(ushort) > ficm.Length)
+            throw new InvalidDataException("PlayGo FICM is shorter than the hash-table count.");
+
+        var assignments = new List<PlayGoAssignment>(count);
+        for (int i = 0; i < count; i++)
+        {
+            ulong hash = U64(hashTable, HashTableHeaderSize + i * sizeof(ulong));
+            int chunk = U16(ficm, FicmHeaderSize + i * sizeof(ushort));
+            string? path = pathByHash is not null && pathByHash.TryGetValue(hash, out string? resolved)
+                ? resolved : null;
+            assignments.Add(new PlayGoAssignment(hash, chunk, path));
+        }
+        return assignments;
     }
 
     private static Section ReadSection(ReadOnlySpan<byte> data, int pointerOffset, string name)

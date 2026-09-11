@@ -38,7 +38,7 @@ public static class CommandRegistry
             "native-entries"),
         Package("Image summary (img_info)", "Inspect",
             "Summarize package category, container, and decoded inner-image state.",
-            "img_info"),
+            "img_info", usePasscode: true),
         new CommandDef
         {
             Name = "Image verify (img_verify)",
@@ -60,6 +60,7 @@ public static class CommandRegistry
                     args.Add("--ref_pkg_path");
                     args.Add(reference);
                 }
+                AddPasscode(args, values);
                 args.Add(values["pkg"]);
                 return args.ToArray();
             },
@@ -103,6 +104,8 @@ public static class CommandRegistry
                 Text("path", "Subtree", string.Empty, "Optional: limit to an inner path, e.g. /uroot"),
                 File("ref", "Reference package", "PS5 packages (*.pkg)|*.pkg|All files (*.*)|*.*",
                     "Optional: base package for a patch/delta image"),
+                Check("repairOffsets", "Repair truncated 64-bit offsets",
+                    "Reconstruct directory offsets from the metadata region (--repair-offsets); listing only"),
             ],
             BuildArgs = values =>
             {
@@ -117,6 +120,9 @@ public static class CommandRegistry
                     args.Add("--path");
                     args.Add(subtree);
                 }
+                if (values.GetValueOrDefault("repairOffsets") == "1")
+                    args.Add("--repair-offsets");
+                AddPasscode(args, values);
                 args.Add(values["pkg"]);
                 return args.ToArray();
             },
@@ -136,17 +142,21 @@ public static class CommandRegistry
                 Check("mount", "Write reconstructed mount image instead of files", "Mount image mode (--mount)"),
                 File("ref", "Reference package", "PS5 packages (*.pkg)|*.pkg|All files (*.*)|*.*",
                     "Optional: base package for a patch/delta image"),
+                Check("verbose", "Verbose progress", "Show per-file extraction progress (--verbose)"),
             ],
             BuildArgs = values =>
             {
                 var args = new List<string>();
                 if (values.GetValueOrDefault("mount") == "1")
                     args.Add("--mount");
+                if (values.GetValueOrDefault("verbose") == "1")
+                    args.Add("--verbose");
                 if (Value(values, "ref") is { Length: > 0 } reference)
                 {
                     args.Add("--ref_pkg_path");
                     args.Add(reference);
                 }
+                AddPasscode(args, values);
                 string target = Value(values, "selection") is { Length: > 0 } selection
                     ? $"{values["pkg"]}:{selection}"
                     : values["pkg"];
@@ -179,15 +189,20 @@ public static class CommandRegistry
                 Combo("type", "Package type", ["base"], "base", ["debug base application"]),
                 Combo("compression", "Inner compression", ["stored", "kraken"], "stored",
                     ["no compression", "Oodle Kraken / auto"]),
+                Slider("krakenLevel", "Kraken level (-4..9)", -4, 9, 7, "Recorded in the compressed image header (default 7)"),
+                Numeric("krakenThreads", "Kraken threads (0=auto)", 0, 256, 0, "0 = auto (processor count)"),
                 Text("contentId", "Content ID", string.Empty, "Optional: overrides sce_sys/param.json"),
                 Text("passcode", "Passcode (32 chars)", CommandDef.DefaultPasscode, "Default: all-zero fake passcode"),
                 Check("noPasscode", "Use the default all-zero passcode", "Ignore the passcode field (--no_passcode)"),
                 Check("noFself", "Skip module fake-signing", "Do not fake-sign ELF modules (--no_fself)"),
                 Check("noRightSprx", "Skip debug right.sprx injection", "Do not inject the debug module (--no_right_sprx)"),
+                Check("verbose", "Verbose progress", "Show stage progress (--verbose)"),
             ],
             BuildArgs = values =>
             {
                 var args = new List<string>();
+                if (values.GetValueOrDefault("verbose") == "1")
+                    args.Add("--verbose");
                 if (Value(values, "type") is { Length: > 0 } type)
                 {
                     args.Add("--type");
@@ -197,6 +212,16 @@ public static class CommandRegistry
                 {
                     args.Add("--compression");
                     args.Add(compression);
+                }
+                if (Value(values, "krakenLevel") is { Length: > 0 } krakenLevel)
+                {
+                    args.Add("--kraken-level");
+                    args.Add(krakenLevel);
+                }
+                if (Value(values, "krakenThreads") is { Length: > 0 } krakenThreads)
+                {
+                    args.Add("--kraken-threads");
+                    args.Add(krakenThreads);
                 }
                 if (Value(values, "contentId") is { Length: > 0 } contentId)
                 {
@@ -238,12 +263,14 @@ public static class CommandRegistry
                 Text("contentId", "Content ID", string.Empty, "Optional: overrides sce_sys/param.json"),
                 Text("passcode", "Passcode (32 chars)", CommandDef.DefaultPasscode, "Default: all-zero fake passcode"),
                 Check("noPasscode", "Use the default all-zero passcode", "Ignore the passcode field (--no_passcode)"),
-                Text("version", "Version NN.NN", string.Empty, "Optional: override the package version"),
                 Combo("compression", "Inner compression", ["stored", "kraken"], "stored",
                     ["no compression", "Oodle Kraken / auto"]),
+                Slider("krakenLevel", "Kraken level (-4..9)", -4, 9, 7, "Recorded in the compressed image header (default 7)"),
+                Numeric("krakenThreads", "Kraken threads (0=auto)", 0, 256, 0, "0 = auto (processor count)"),
                 Folder("staging", "Staging folder", "Optional: keep intermediate files here"),
                 Check("keepStaging", "Keep staging files", "Do not delete intermediates (--keep-staging)"),
                 Check("useEmbedded", "Use embedded right.sprx", "Use the built-in debug module (--use-embedded-right-sprx)"),
+                Check("verbose", "Verbose progress", "Show per-file and stage progress (--verbose)"),
             ],
             BuildArgs = values =>
             {
@@ -267,15 +294,20 @@ public static class CommandRegistry
                     args.Add("--passcode");
                     args.Add(passcode);
                 }
-                if (Value(values, "version") is { Length: > 0 } version)
-                {
-                    args.Add("--version");
-                    args.Add(version);
-                }
                 if (Value(values, "compression") is { Length: > 0 } compression)
                 {
                     args.Add("--compression");
                     args.Add(compression);
+                }
+                if (Value(values, "krakenLevel") is { Length: > 0 } krakenLevel)
+                {
+                    args.Add("--kraken-level");
+                    args.Add(krakenLevel);
+                }
+                if (Value(values, "krakenThreads") is { Length: > 0 } krakenThreads)
+                {
+                    args.Add("--kraken-threads");
+                    args.Add(krakenThreads);
                 }
                 if (Value(values, "staging") is { Length: > 0 } staging)
                 {
@@ -286,6 +318,8 @@ public static class CommandRegistry
                     args.Add("--keep-staging");
                 if (values.GetValueOrDefault("useEmbedded") == "1")
                     args.Add("--use-embedded-right-sprx");
+                if (values.GetValueOrDefault("verbose") == "1")
+                    args.Add("--verbose");
                 args.Add(Require(values, "backup", "Backup folder"));
                 return args.ToArray();
             },
@@ -489,7 +523,7 @@ public static class CommandRegistry
     // ==================================================================
     // Helpers
     // ==================================================================
-    private static CommandDef Package(string name, string group, string description, string cliWord) => new()
+    private static CommandDef Package(string name, string group, string description, string cliWord, bool usePasscode = false) => new()
     {
         Name = name,
         Group = group,
@@ -497,9 +531,30 @@ public static class CommandRegistry
         Description = description,
         CliWord = cliWord,
         Fields = [],
-        BuildArgs = values => [values["pkg"]],
+        BuildArgs = values =>
+        {
+            var args = new List<string>();
+            if (usePasscode)
+                AddPasscode(args, values);
+            args.Add(values["pkg"]);
+            return args.ToArray();
+        },
         UsesSelectedPackage = true,
     };
+
+    /// <summary>
+    /// Appends the package bar's passcode for commands that accept one. The string is passed
+    /// explicitly so the CLI does not fall back to its own default when the user typed a custom
+    /// debug passcode; an empty field falls back to the CLI default (all-zero fake passcode).
+    /// </summary>
+    private static void AddPasscode(List<string> args, IReadOnlyDictionary<string, string> values)
+    {
+        if (Value(values, "passcode") is { Length: > 0 } passcode)
+        {
+            args.Add("--passcode");
+            args.Add(passcode);
+        }
+    }
 
     private static string Value(IReadOnlyDictionary<string, string> values, string id) =>
         values.TryGetValue(id, out string? value) ? value : string.Empty;
@@ -517,6 +572,28 @@ public static class CommandRegistry
         new() { Id = id, Label = label, Kind = FieldKind.Folder, Hint = hint };
     private static CommandField Text(string id, string label, string @default = "", string hint = "") =>
         new() { Id = id, Label = label, Kind = FieldKind.Text, Default = @default, Hint = hint };
+    private static CommandField Numeric(string id, string label, int minimum, int maximum, int @default, string hint = "") =>
+        new()
+        {
+            Id = id,
+            Label = label,
+            Kind = FieldKind.Numeric,
+            Minimum = minimum,
+            Maximum = maximum,
+            Default = @default.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            Hint = hint,
+        };
+    private static CommandField Slider(string id, string label, int minimum, int maximum, int @default, string hint = "") =>
+        new()
+        {
+            Id = id,
+            Label = label,
+            Kind = FieldKind.Slider,
+            Minimum = minimum,
+            Maximum = maximum,
+            Default = @default.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            Hint = hint,
+        };
     private static CommandField Combo(string id, string label, string[] choices, string @default, string[]? remarks = null) =>
         new() { Id = id, Label = label, Kind = FieldKind.Combo, Choices = choices, Default = @default, ChoiceRemarks = remarks };
     private static CommandField Check(string id, string label, string hint = "") =>

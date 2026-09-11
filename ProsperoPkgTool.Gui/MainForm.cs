@@ -3,7 +3,7 @@ using System.Diagnostics;
 namespace ProsperoPkgTool.Gui;
 
 /// <summary>
-/// Main GUI window. The GUI drives only ProsperoPkgTool's native, clean-room operations —
+/// Main GUI window. The GUI drives only ProsperoPkgTool's native, clean-room operations -
 /// there is no Sony-tool integration and no GPL fPKG backend.
 /// </summary>
 public sealed class MainForm : Form
@@ -17,9 +17,7 @@ public sealed class MainForm : Form
     {
         Dock = DockStyle.Fill,
         Orientation = Orientation.Horizontal,
-        Panel1MinSize = 260,
-        Panel2MinSize = 130,
-        FixedPanel = FixedPanel.Panel2,
+        FixedPanel = FixedPanel.Panel1,
     };
     private readonly ToolStripStatusLabel _packageStatus = new("No package selected");
     private readonly ToolStripStatusLabel _operationStatus = new("Ready");
@@ -32,7 +30,7 @@ public sealed class MainForm : Form
     private CancellationTokenSource? _cancellation;
     private Process? _process;
     private OperationsPane _activePane;
-    private int _savedOutputSplitter = 370;
+    private int _savedOutputSplitter = 300;
     private int _savedPackageSplitter = 235;
     private int _savedToolSplitter = 235;
 
@@ -118,6 +116,7 @@ public sealed class MainForm : Form
         {
             _activePane = _operationTabs.SelectedIndex == 1 ? _toolOperations : _packageOperations;
         };
+        _output.CancelRequested += CancelOperation;
         _packageBar.PackageChanged += (_, _) =>
         {
             _packageStatus.Text = _packageBar.PackagePath.Length == 0
@@ -260,6 +259,7 @@ public sealed class MainForm : Form
     {
         _packageOperations.SetRunning(running);
         _toolOperations.SetRunning(running);
+        _output.SetRunning(running);
         _operationTabs.Enabled = !running;
     }
 
@@ -327,6 +327,7 @@ public sealed class MainForm : Form
                     case "width" when int.TryParse(value, out int width): Width = Math.Max(MinimumSize.Width, width); break;
                     case "height" when int.TryParse(value, out int height): Height = Math.Max(MinimumSize.Height, height); break;
                     case "tab" when int.TryParse(value, out int tab): _operationTabs.SelectedIndex = Math.Clamp(tab, 0, 1); break;
+                    case "browse": OperationsPane.LastBrowsedPath = value; break;
                     case "outputSplitter" when int.TryParse(value, out int output): _savedOutputSplitter = output; break;
                     case "packageSplitter" when int.TryParse(value, out int package): _savedPackageSplitter = package; break;
                     case "toolSplitter" when int.TryParse(value, out int tool): _savedToolSplitter = tool; break;
@@ -341,17 +342,35 @@ public sealed class MainForm : Form
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
+        ConfigureMinSizes(_outputSplit, 160, 180);
         SetSplitter(_outputSplit, _savedOutputSplitter);
         SetSplitter(_packageOperations.Split, _savedPackageSplitter);
         SetSplitter(_toolOperations.Split, _savedToolSplitter);
     }
 
+    /// <summary>
+    /// Sets a split container's panel minimums only when the container is large enough to hold
+    /// them. <see cref="SplitContainer"/> throws from its <c>ApplyPanel2MinSize</c> path when a
+    /// minimum exceeds the available span (or when the current <c>SplitterDistance</c> would fall
+    /// outside the new range), so short/small windows must skip this step rather than crash.
+    /// </summary>
+    private static void ConfigureMinSizes(SplitContainer split, int panel1Min, int panel2Min)
+    {
+        int span = split.Orientation == Orientation.Horizontal ? split.ClientSize.Height : split.ClientSize.Width;
+        if (span < panel1Min + panel2Min + split.SplitterWidth)
+            return;
+        split.Panel1MinSize = panel1Min;
+        split.Panel2MinSize = panel2Min;
+    }
+
     private static void SetSplitter(SplitContainer split, int distance)
     {
-        int span = split.Orientation == Orientation.Horizontal ? split.Height : split.Width;
-        int maximum = span - split.Panel2MinSize;
-        if (distance >= split.Panel1MinSize && distance <= maximum)
-            split.SplitterDistance = distance;
+        int span = split.Orientation == Orientation.Horizontal ? split.ClientSize.Height : split.ClientSize.Width;
+        int minimum = split.Panel1MinSize;
+        int maximum = span - split.Panel2MinSize - split.SplitterWidth;
+        if (maximum < minimum)
+            return;
+        split.SplitterDistance = Math.Clamp(distance, minimum, maximum);
     }
 
     private void SaveSettings()
@@ -366,6 +385,7 @@ public sealed class MainForm : Form
                 "width=" + Width,
                 "height=" + Height,
                 "tab=" + _operationTabs.SelectedIndex,
+                "browse=" + OperationsPane.LastBrowsedPath,
                 "outputSplitter=" + _outputSplit.SplitterDistance,
                 "packageSplitter=" + _packageOperations.Split.SplitterDistance,
                 "toolSplitter=" + _toolOperations.Split.SplitterDistance,

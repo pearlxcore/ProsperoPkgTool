@@ -11,6 +11,7 @@ public sealed class OutputConsole : UserControl
     private readonly TabControl _tabs = new() { Dock = DockStyle.Fill };
     private readonly List<TabPage> _pages = [];
     private readonly HashSet<TabPage> _running = [];
+    private readonly Button _cancel = new() { Text = "Cancel", Width = 90, Enabled = false };
     private readonly ConcurrentQueue<(TabPage Page, string Text)> _pending = new();
     private readonly System.Windows.Forms.Timer _flushTimer = new() { Interval = 100 };
 
@@ -22,7 +23,11 @@ public sealed class OutputConsole : UserControl
         _flushTimer.Start();
     }
 
+    public event Action? CancelRequested;
+
     public bool AnyRunning => _running.Count > 0;
+
+    public void SetRunning(bool running) => _cancel.Enabled = running;
 
     public TabPage StartRun(string name)
     {
@@ -86,6 +91,12 @@ public sealed class OutputConsole : UserControl
         close.Click += (_, _) => CloseSelected();
         var clear = new Button { Text = "Clear finished", Width = 105 };
         clear.Click += (_, _) => ClearFinished();
+        _cancel.Click += (_, _) =>
+        {
+            _cancel.Enabled = false;
+            CancelRequested?.Invoke();
+        };
+        toolbar.Controls.Add(_cancel);
         toolbar.Controls.Add(close);
         toolbar.Controls.Add(clear);
 

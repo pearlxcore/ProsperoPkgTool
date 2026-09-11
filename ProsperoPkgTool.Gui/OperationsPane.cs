@@ -23,6 +23,9 @@ public sealed class OperationsPane : UserControl
     public SplitContainer Split => _split;
     public bool CanRun => _current is not null;
 
+    /// <summary>Last file/folder picked through a browse dialog, shared by every pane.</summary>
+    public static string LastBrowsedPath { get; set; } = string.Empty;
+
     public void SetCommands(IReadOnlyList<CommandDef> commands)
     {
         _tree.BeginUpdate();
@@ -89,10 +92,28 @@ public sealed class OperationsPane : UserControl
     protected override void OnLoad(EventArgs e)
     {
         base.OnLoad(e);
-        _split.Panel1MinSize = 175;
-        _split.Panel2MinSize = 380;
-        if (_split.Width > 600)
-            _split.SplitterDistance = 235;
+        ApplySplitLayout();
+        _split.SizeChanged += (_, _) => ApplySplitLayout();
+    }
+
+    /// <summary>
+    /// Applies the pane minimums only once the split is wide enough to satisfy them. Setting a
+    /// minimum larger than the available span (or leaving a stale <c>SplitterDistance</c> outside
+    /// the new range) makes <see cref="SplitContainer"/> throw; deferring until there is room keeps
+    /// startup safe on small/short windows and re-applies the layout as the window grows.
+    /// </summary>
+    private void ApplySplitLayout()
+    {
+        int span = _split.Orientation == Orientation.Horizontal ? _split.ClientSize.Height : _split.ClientSize.Width;
+        const int panel1Min = 175;
+        const int panel2Min = 380;
+        if (span < panel1Min + panel2Min + _split.SplitterWidth)
+            return;
+        _split.Panel1MinSize = panel1Min;
+        _split.Panel2MinSize = panel2Min;
+        int maximum = span - panel2Min - _split.SplitterWidth;
+        if (maximum >= panel1Min)
+            _split.SplitterDistance = Math.Clamp(235, panel1Min, maximum);
     }
 
     private void SelectCommand(CommandDef? command)
@@ -100,7 +121,7 @@ public sealed class OperationsPane : UserControl
         if (command is null)
             return;
         _current = command;
-        _description.Text = $"{command.Title} — {command.Description}";
+        _description.Text = $"{command.Title} - {command.Description}";
         BuildFields(command);
         _run.Enabled = true;
         SelectionChanged?.Invoke(command);
@@ -172,8 +193,58 @@ public sealed class OperationsPane : UserControl
             PlaceholderText = field.Hint,
             Font = new Font("Cascadia Mono", 9f),
         },
+        FieldKind.Numeric => MakeNumeric(field),
+        FieldKind.Slider => MakeSlider(field),
         _ => new TextBox { Text = field.Default, PlaceholderText = field.Hint },
     };
+
+    private static Control MakeNumeric(CommandField field)
+    {
+        var numeric = new NumericUpDown
+        {
+            Minimum = field.Minimum,
+            Maximum = field.Maximum,
+            Increment = field.Increment,
+            TextAlign = HorizontalAlignment.Left,
+        };
+        numeric.Value = int.TryParse(field.Default, out int value)
+            ? Math.Clamp(value, field.Minimum, field.Maximum)
+            : Math.Clamp(0, field.Minimum, field.Maximum);
+        return numeric;
+    }
+
+    private static Control MakeSlider(CommandField field)
+    {
+        int initial = int.TryParse(field.Default, out int value)
+            ? Math.Clamp(value, field.Minimum, field.Maximum)
+            : field.Minimum;
+        var panel = new TableLayoutPanel { ColumnCount = 2, RowCount = 1, Margin = new Padding(0) };
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 44));
+        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        var track = new TrackBar
+        {
+            Minimum = field.Minimum,
+            Maximum = field.Maximum,
+            TickStyle = TickStyle.None,
+            SmallChange = 1,
+            LargeChange = 1,
+            Value = initial,
+            Dock = DockStyle.Fill,
+        };
+        var readout = new Label
+        {
+            Text = initial.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            TextAlign = ContentAlignment.MiddleLeft,
+            Dock = DockStyle.Fill,
+            AutoSize = false,
+        };
+        track.ValueChanged += (_, _) =>
+            readout.Text = track.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        panel.Controls.Add(track, 0, 0);
+        panel.Controls.Add(readout, 1, 0);
+        return panel;
+    }
 
     private static Control MakeCombo(CommandField field)
     {
@@ -181,7 +252,7 @@ public sealed class OperationsPane : UserControl
         for (int index = 0; index < field.Choices.Length; index++)
         {
             string remark = field.ChoiceRemarks is { } remarks && index < remarks.Length ? remarks[index] : string.Empty;
-            combo.Items.Add(remark.Length == 0 ? field.Choices[index] : $"{field.Choices[index]} — {remark}");
+            combo.Items.Add(remark.Length == 0 ? field.Choices[index] : $"{field.Choices[index]} - {remark}");
         }
         if (combo.Items.Count > 0)
         {
@@ -207,11 +278,23 @@ public sealed class OperationsPane : UserControl
 
     private void BrowsePath(TextBox box, CommandField field, PathInputMode mode)
     {
+        string current = box.Text.Trim();
         if (mode == PathInputMode.Folder)
         {
             using var dialog = new FolderBrowserDialog { Description = field.Label, UseDescriptionForTitle = true };
+            string start = Directory.Exists(current)
+                ? current
+                : Directory.Exists(LastBrowsedPath) ? LastBrowsedPath : string.Empty;
+            if (start.Length > 0)
+            {
+                dialog.SelectedPath = start;
+                dialog.InitialDirectory = start;
+            }
             if (dialog.ShowDialog(FindForm()) == DialogResult.OK)
+            {
                 box.Text = dialog.SelectedPath;
+                LastBrowsedPath = dialog.SelectedPath;
+            }
             return;
         }
         FileDialog fileDialog = mode == PathInputMode.OpenFile ? new OpenFileDialog() : new SaveFileDialog();
@@ -219,9 +302,28 @@ public sealed class OperationsPane : UserControl
         {
             fileDialog.Title = field.Label;
             fileDialog.Filter = field.Filter.Length > 0 ? field.Filter : "All files (*.*)|*.*";
+            string startDirectory = ResolveStartDirectory(current);
+            if (startDirectory.Length > 0)
+                fileDialog.InitialDirectory = startDirectory;
+            if (current.Length > 0 && File.Exists(current))
+                fileDialog.FileName = current;
             if (fileDialog.ShowDialog(FindForm()) == DialogResult.OK)
+            {
                 box.Text = fileDialog.FileName;
+                LastBrowsedPath = fileDialog.FileName;
+            }
         }
+    }
+
+    private static string ResolveStartDirectory(string current)
+    {
+        if (File.Exists(current))
+            return Path.GetDirectoryName(current) ?? string.Empty;
+        if (Directory.Exists(current))
+            return current;
+        if (File.Exists(LastBrowsedPath))
+            return Path.GetDirectoryName(LastBrowsedPath) ?? string.Empty;
+        return Directory.Exists(LastBrowsedPath) ? LastBrowsedPath : string.Empty;
     }
 
     private void RaiseRun()
@@ -236,6 +338,9 @@ public sealed class OperationsPane : UserControl
                 TextBox text => text.Text.Trim(),
                 ComboBox combo => ExtractComboValue(combo.SelectedItem?.ToString() ?? string.Empty),
                 CheckBox check => check.Checked ? "1" : "0",
+                NumericUpDown numeric => numeric.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                TableLayoutPanel panel when panel.Controls.OfType<TrackBar>().FirstOrDefault() is { } track =>
+                    track.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 TableLayoutPanel panel => panel.Controls.OfType<TextBox>().FirstOrDefault()?.Text.Trim() ?? string.Empty,
                 _ => string.Empty,
             };
@@ -245,7 +350,7 @@ public sealed class OperationsPane : UserControl
 
     private static string ExtractComboValue(string value)
     {
-        int separator = value.IndexOf(" — ", StringComparison.Ordinal);
+        int separator = value.IndexOf(" - ", StringComparison.Ordinal);
         return separator >= 0 ? value[..separator] : value;
     }
 
