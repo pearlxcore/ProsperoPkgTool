@@ -45,10 +45,6 @@ public static class SourceFolderValidator
         {
             if (!File.Exists(Path.Combine(root, "eboot.bin")))
                 report.Error("EBOOT_MISSING", "Application source requires eboot.bin.", Path.Combine(root, "eboot.bin"));
-            if (param.ApplicationDrmType == "free")
-                report.Error("PARAM_DRM_COMBINATION",
-                    "Sony Publishing Tools 1.21 rejects applicationCategoryType 0 with applicationDrmType 'free'.",
-                    paramPath);
             WarnIfMissing(report, root, "sce_sys/pic0.png", "Sony verification requires pic0.png for an original application package.");
             WarnIfMissing(report, root, "sce_sys/pic1.png", "Sony verification requires pic1.png for an original application package.");
             WarnIfMissing(report, root, "sce_sys/pic2.png", "Sony verification requires pic2.png for an original application package.");
@@ -69,7 +65,9 @@ public static class SourceFolderValidator
                 playGo = PlayGoChunkReader.Read(playGoPath);
                 if (param is not null && playGo.ContentId.Length > 0 &&
                     !playGo.ContentId.Equals(param.ContentId, StringComparison.Ordinal))
-                    report.Error("PLAYGO_CONTENT_ID", "PlayGo content ID does not match param.json.", playGoPath);
+                    report.Warning("PLAYGO_CONTENT_ID",
+                        "PlayGo content ID does not match param.json; the package content ID is used instead.",
+                        playGoPath);
             }
             catch (Exception exception) when (exception is IOException or InvalidDataException)
             {

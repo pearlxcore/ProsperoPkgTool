@@ -38,8 +38,11 @@ public sealed class DebugPackageBuildOptions
     /// <summary>Raw <c>sce_sys/param.json</c> bytes; the builder normalizes and stamps them.</summary>
     public required byte[] ParamJson { get; init; }
 
-    /// <summary>Inner-image compression policy.</summary>
-    public ProsperoInnerCompressionMode Compression { get; init; } = ProsperoInnerCompressionMode.Stored;
+    /// <summary>
+    /// Inner-image compression policy. Defaults to <see cref="ProsperoInnerCompressionMode.Auto"/>
+    /// (Kraken where it helps), matching the publisher-built Sony container's compressed metadata.
+    /// </summary>
+    public ProsperoInnerCompressionMode Compression { get; init; } = ProsperoInnerCompressionMode.Auto;
 
     /// <summary>Kraken level recorded in the compressed metadata header.</summary>
     public int KrakenLevel { get; init; } = KrakenTuning.DefaultLevel;
@@ -125,11 +128,9 @@ public static class ProsperoDebugPackageBuilder
 
         ProsperoParam param = ProsperoParamReader.Read(options.ParamJson);
 
-        // The SDK version comes from the raw eboot before any fake-signing rewrites it.
-        byte[]? ebootSource = ReadFileBytes(files, "/eboot.bin");
-        ulong sdkVersion = ebootSource is null ? 0 : ProsperoPublisherParamJson.ResolveSdkVersion(ebootSource);
-        byte[] paramJson = ProsperoPublisherParamJson.Build(options.ParamJson,
-            DateTimeOffset.FromUnixTimeSeconds(tsSec).UtcDateTime, sdkVersion);
+        // The source param.json is packaged verbatim: the Sony fixture carries the publisher document
+        // unchanged, so the builder does not re-serialize, reorder, or stamp any field.
+        byte[] paramJson = options.ParamJson;
 
         var innerFiles = new List<ProsperoInnerImageAssembler.InnerFile>(files);
 
@@ -185,7 +186,7 @@ public static class ProsperoDebugPackageBuilder
 
         IReadOnlyDictionary<string, byte[]> sceSysFiles =
             options.SceSysFiles ?? new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
-        PlayGoProject playGoProject = options.PlayGo ?? ResolvePlayGoProject(sceSysFiles, options.ContentId);
+        PlayGoProject playGoProject = options.PlayGo ?? ResolvePlayGoProject(sceSysFiles, options.ContentId, console);
 
         // Large inputs use a file-backed pipeline (temp workspace) so the assembled inner/outer
         // images never materialize as a single byte[]; small inputs keep the in-memory path.
@@ -198,17 +199,66 @@ public static class ProsperoDebugPackageBuilder
     }
 
     /// <summary>Parses a source PLGX when present, otherwise generates the observed default project.</summary>
-    private static PlayGoProject ResolvePlayGoProject(IReadOnlyDictionary<string, byte[]> sceSysFiles, string contentId) =>
-        sceSysFiles.TryGetValue("playgo-chunk.dat", out byte[]? bytes)
-            ? PlayGoChunkReader.Read(bytes)
-            : ProsperoPlayGoChunkBuilder.CreateDefaultProject(contentId);
-
-    /// <summary>Reads one inner file fully, regardless of whether it is memory, path, or provider backed.</summary>
-    private static byte[]? ReadFileBytes(IReadOnlyList<ProsperoInnerImageAssembler.InnerFile> files, string path)
+    private static PlayGoProject ResolvePlayGoProject(
+        IReadOnlyDictionary<string, byte[]> sceSysFiles, string contentId, DebugPackageBuildLog console)
     {
-        ProsperoInnerImageAssembler.InnerFile? file = files.FirstOrDefault(f =>
-            string.Equals(f.Path, path, StringComparison.Ordinal));
-        return file is null ? null : ReadInnerFileBytes(file);
+        if (!sceSysFiles.TryGetValue("playgo-chunk.dat", out byte[]? bytes))
+            return ProsperoPlayGoChunkBuilder.CreateDefaultProject(contentId);
+        try
+        {
+            return PlayGoChunkReader.Read(bytes);
+        }
+        catch (Exception ex) when (ex is InvalidDataException or IOException)
+        {
+            console.Log($"  warning: sce_sys/playgo-chunk.dat could not be parsed ({ex.Message}); using the default single-chunk project.");
+            return ProsperoPlayGoChunkBuilder.CreateDefaultProject(contentId);
+        }
+    }
+
+    /// <summary>
+    /// FIH 0x9C: the content-version major encoded as BCD in the top byte of the high dword
+    /// (01.000.000 -> 0x01000000), derived from param.json. Returns zero when malformed.
+    /// </summary>
+    private static uint ContentVersionHigh(string? contentVersion)
+    {
+        if (string.IsNullOrWhiteSpace(contentVersion))
+            return 0;
+        string major = contentVersion.Split('.')[0].Trim();
+        if (major.Length is 0 or > 2 ||
+            !byte.TryParse(major, System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out byte value))
+            return 0;
+        uint bcd = (uint)(((value / 10) << 4) | (value % 10));
+        return bcd << 24;
+    }
+
+    /// <summary>
+    /// Builds the PlayGo descriptor family (chunk/hash-table/ficm), falling back to the observed
+    /// single-chunk default model when the source project cannot describe this tree (for example a
+    /// dump's stale chunk assignments or an unsupported scenario model).
+    /// </summary>
+    private static (ProsperoPlayGoChunkBuildResult Chunk, byte[] HashTable, byte[] Ficm) BuildPlayGoFamily(
+        string contentId, PlayGoProject project, ProsperoInnerImageAssembler.InnerImageResult inner,
+        ulong fihPfsOffset, ulong fihCntOffset, DebugPackageBuildLog console)
+    {
+        try
+        {
+            return Build(project);
+        }
+        catch (InvalidDataException ex)
+        {
+            console.Log($"  warning: PlayGo project is not usable ({ex.Message}); using the default single-chunk project.");
+            return Build(ProsperoPlayGoChunkBuilder.CreateDefaultProject(contentId));
+        }
+
+        (ProsperoPlayGoChunkBuildResult, byte[], byte[]) Build(PlayGoProject p)
+        {
+            ProsperoPlayGoChunkBuildResult chunk = ProsperoPlayGoChunkBuilder.Build(
+                contentId, p, inner, fihPfsOffset, fihCntOffset);
+            IReadOnlyList<ProsperoPlayGoFileRecord> records = ProsperoPlayGoRecordBuilder.Build(
+                inner, p.FileChunkAssignments);
+            return (chunk, ProsperoPlayGoHashTableBuilder.Build(records), ProsperoPlayGoFicmBuilder.Build(records));
+        }
     }
 
     private static DebugPackageBuildResult RunInMemory(
@@ -224,6 +274,7 @@ public static class ProsperoDebugPackageBuilder
         ProsperoInnerCompressionMode compressionMode = buildOptions.Compression;
         int krakenLevel = buildOptions.KrakenLevel;
         int krakenThreads = buildOptions.KrakenThreads;
+        uint contentVersionHi = ContentVersionHigh(param.ContentVersion);
 
         var assembler = new ProsperoInnerImageAssembler(tsSec, tsNsec);
         ProsperoInnerImageAssembler.InnerImageResult innerResult = assembler.Build(
@@ -284,10 +335,12 @@ public static class ProsperoDebugPackageBuilder
             Flags1 = ProsperoCntBuilder.Flags1For(CntEntryId.ParamJson),
         });
 
-        // imagedigs entry: SHA3-256 of each plaintext outer-PFS block, in block order.
+        // imagedigs entry: SHA3-256 of each plaintext outer-PFS block, in block order. The on-disk
+        // table stores each 32-byte digest byte-reversed (the Sony fixture and the reference writer
+        // both do), so the internal forward digests are reversed for the container entry only.
         entries.Add(new ProsperoCntBuilder.Entry
         {
-            Id = CntEntryId.Imagedigs, Name = null, Data = imageDigests,
+            Id = CntEntryId.Imagedigs, Name = null, Data = ReverseDigests(imageDigests),
             Flags1 = ProsperoCntBuilder.Flags1For(CntEntryId.Imagedigs),
         });
 
@@ -296,32 +349,20 @@ public static class ProsperoDebugPackageBuilder
         // optional compatibility input for chunk/scenario vocabulary; it is parsed, never copied.
         ulong fihPfsOffset = ProsperoFihBuilder.HeaderRegionSize;
         ulong fihCntOffset = checked(fihPfsOffset + (ulong)outerImage.Length);
-        ProsperoPlayGoChunkBuildResult playGoChunk = ProsperoPlayGoChunkBuilder.Build(
-            contentId, playGoProject, innerResult, fihPfsOffset, fihCntOffset);
-        IReadOnlyList<ProsperoPlayGoFileRecord> playGoRecords = ProsperoPlayGoRecordBuilder.Build(
-            innerResult, playGoProject.FileChunkAssignments);
-        byte[] playGoHashTable = ProsperoPlayGoHashTableBuilder.Build(playGoRecords);
-        byte[] playGoFicm = ProsperoPlayGoFicmBuilder.Build(playGoRecords);
+        (ProsperoPlayGoChunkBuildResult playGoChunk, byte[] playGoHashTable, byte[] playGoFicm) =
+            BuildPlayGoFamily(contentId, playGoProject, innerResult, fihPfsOffset, fihCntOffset, console);
 
         entries.Add(new ProsperoCntBuilder.Entry
         {
             Id = CntEntryId.PlaygoChunkDat, Name = "playgo-chunk.dat", Data = playGoChunk.Data,
             Flags1 = ProsperoCntBuilder.Flags1For(CntEntryId.PlaygoChunkDat),
         });
-        entries.Add(new ProsperoCntBuilder.Entry
-        {
-            Id = CntEntryId.PlaygoHashTable, Name = "playgo-hash-table.dat", Data = playGoHashTable,
-            Flags1 = ProsperoCntBuilder.Flags1For(CntEntryId.PlaygoHashTable),
-        });
-        entries.Add(new ProsperoCntBuilder.Entry
-        {
-            Id = CntEntryId.PlaygoFicm, Name = "playgo-ficm.dat", Data = playGoFicm,
-            Flags1 = ProsperoCntBuilder.Flags1For(CntEntryId.PlaygoFicm),
-        });
 
         // sce_sys media/system files are outer CNT entries (never inner-PFS files). PNG icons and
         // pictures also get a generated BC7 DDS companion when the source does not ship one.
         // Generated entries (PlayGo family, param.json) win over a source-supplied duplicate id.
+        // The media entries sit between playgo-chunk.dat and the hash-table/ficm pair, matching the
+        // Sony container's on-disk entry order.
         foreach (ProsperoSceSysMedia.Entry media in ProsperoSceSysMedia.Collect(sceSysFiles, param.ApplicationDrmType))
         {
             if (entries.Any(e => (uint)e.Id == (uint)media.Id))
@@ -332,6 +373,17 @@ public static class ProsperoDebugPackageBuilder
                 Flags1 = media.Flags1, Flags2 = media.Flags2,
             });
         }
+
+        entries.Add(new ProsperoCntBuilder.Entry
+        {
+            Id = CntEntryId.PlaygoHashTable, Name = "playgo-hash-table.dat", Data = playGoHashTable,
+            Flags1 = ProsperoCntBuilder.Flags1For(CntEntryId.PlaygoHashTable),
+        });
+        entries.Add(new ProsperoCntBuilder.Entry
+        {
+            Id = CntEntryId.PlaygoFicm, Name = "playgo-ficm.dat", Data = playGoFicm,
+            Flags1 = ProsperoCntBuilder.Flags1For(CntEntryId.PlaygoFicm),
+        });
 
         // FIH geometry + accounting are needed before the CNT so the embedded CNT can carry
         // pfs_signed_digest = SHA3-256(FIH header) at 0x460. The reference stamps 0x460 before it
@@ -352,7 +404,7 @@ public static class ProsperoDebugPackageBuilder
             nestedImageDigest: nestedDigest,
             nestedImageSize: naps.Length,
             nestedMetaBaseBlocks: nestedMetaBaseBlocks,
-            contentVersionHi: 0x01000000,
+            contentVersionHi: contentVersionHi,
             innerContentInodes: innerResult.InnerContentInodes,
             appFileCount: innerResult.AppFileCount,
             metaBlockCount: fihMetaBlockCount,
@@ -376,7 +428,7 @@ public static class ProsperoDebugPackageBuilder
             cnt, FihVariant.Debug,
             nestedImageDigest: nestedDigest, nestedImageSize: naps.Length,
             nestedMetaBaseBlocks: nestedMetaBaseBlocks,
-            contentVersionHi: 0x01000000,
+            contentVersionHi: contentVersionHi,
             innerContentInodes: innerResult.InnerContentInodes,
             appFileCount: innerResult.AppFileCount,
             metaBlockCount: fihMetaBlockCount,
@@ -392,7 +444,7 @@ public static class ProsperoDebugPackageBuilder
             cnt, FihVariant.Debug,
             nestedImageDigest: nestedDigest, nestedImageSize: naps.Length,
             nestedMetaBaseBlocks: nestedMetaBaseBlocks,
-            contentVersionHi: 0x01000000,
+            contentVersionHi: contentVersionHi,
             innerContentInodes: innerResult.InnerContentInodes,
             appFileCount: innerResult.AppFileCount,
             metaBlockCount: fihMetaBlockCount,
@@ -427,6 +479,7 @@ public static class ProsperoDebugPackageBuilder
         ProsperoInnerCompressionMode compressionMode = buildOptions.Compression;
         int krakenLevel = buildOptions.KrakenLevel;
         int krakenThreads = buildOptions.KrakenThreads;
+        uint contentVersionHi = ContentVersionHigh(param.ContentVersion);
 
         string tempRoot = Path.Combine(
             buildOptions.TempDirectory ?? Path.GetTempPath(), "libprospero-" + Guid.NewGuid().ToString("N"));
@@ -487,38 +540,27 @@ public static class ProsperoDebugPackageBuilder
                 Id = CntEntryId.ParamJson, Name = "param.json", Data = paramJson,
                 Flags1 = ProsperoCntBuilder.Flags1For(CntEntryId.ParamJson),
             });
-            // The streamed outer build already produced the per-block digest table.
+            // The streamed outer build already produced the per-block digest table; each 32-byte
+            // digest is stored byte-reversed on disk (the container's imagedigs convention).
             entries.Add(new ProsperoCntBuilder.Entry
             {
-                Id = CntEntryId.Imagedigs, Name = null, Data = outerBuild.ImageDigests,
+                Id = CntEntryId.Imagedigs, Name = null, Data = ReverseDigests(outerBuild.ImageDigests),
                 Flags1 = ProsperoCntBuilder.Flags1For(CntEntryId.Imagedigs),
             });
 
             ulong fihPfsOffset = ProsperoFihBuilder.HeaderRegionSize;
             ulong fihCntOffset = checked(fihPfsOffset + (ulong)outerLength);
-            ProsperoPlayGoChunkBuildResult playGoChunk = ProsperoPlayGoChunkBuilder.Build(
-                contentId, playGoProject, innerResult, fihPfsOffset, fihCntOffset);
-            IReadOnlyList<ProsperoPlayGoFileRecord> playGoRecords = ProsperoPlayGoRecordBuilder.Build(
-                innerResult, playGoProject.FileChunkAssignments);
-            byte[] playGoHashTable = ProsperoPlayGoHashTableBuilder.Build(playGoRecords);
-            byte[] playGoFicm = ProsperoPlayGoFicmBuilder.Build(playGoRecords);
+            (ProsperoPlayGoChunkBuildResult playGoChunk, byte[] playGoHashTable, byte[] playGoFicm) =
+                BuildPlayGoFamily(contentId, playGoProject, innerResult, fihPfsOffset, fihCntOffset, console);
 
             entries.Add(new ProsperoCntBuilder.Entry
             {
                 Id = CntEntryId.PlaygoChunkDat, Name = "playgo-chunk.dat", Data = playGoChunk.Data,
                 Flags1 = ProsperoCntBuilder.Flags1For(CntEntryId.PlaygoChunkDat),
             });
-            entries.Add(new ProsperoCntBuilder.Entry
-            {
-                Id = CntEntryId.PlaygoHashTable, Name = "playgo-hash-table.dat", Data = playGoHashTable,
-                Flags1 = ProsperoCntBuilder.Flags1For(CntEntryId.PlaygoHashTable),
-            });
-            entries.Add(new ProsperoCntBuilder.Entry
-            {
-                Id = CntEntryId.PlaygoFicm, Name = "playgo-ficm.dat", Data = playGoFicm,
-                Flags1 = ProsperoCntBuilder.Flags1For(CntEntryId.PlaygoFicm),
-            });
 
+            // Media entries sit between playgo-chunk.dat and the hash-table/ficm pair, matching the
+            // Sony container's on-disk entry order.
             foreach (ProsperoSceSysMedia.Entry media in ProsperoSceSysMedia.Collect(sceSysFiles, param.ApplicationDrmType))
             {
                 if (entries.Any(e => (uint)e.Id == (uint)media.Id))
@@ -529,6 +571,17 @@ public static class ProsperoDebugPackageBuilder
                     Flags1 = media.Flags1, Flags2 = media.Flags2,
                 });
             }
+
+            entries.Add(new ProsperoCntBuilder.Entry
+            {
+                Id = CntEntryId.PlaygoHashTable, Name = "playgo-hash-table.dat", Data = playGoHashTable,
+                Flags1 = ProsperoCntBuilder.Flags1For(CntEntryId.PlaygoHashTable),
+            });
+            entries.Add(new ProsperoCntBuilder.Entry
+            {
+                Id = CntEntryId.PlaygoFicm, Name = "playgo-ficm.dat", Data = playGoFicm,
+                Flags1 = ProsperoCntBuilder.Flags1For(CntEntryId.PlaygoFicm),
+            });
 
             byte[] nestedDigest = Sha3.Sha3_256(naps);
             long nestedMetaBaseBlocks = innerResult.MetaBaseLogical / ProsperoOuterPfsBuilder.BlockSize;
@@ -544,7 +597,7 @@ public static class ProsperoDebugPackageBuilder
                 nestedImageDigest: nestedDigest,
                 nestedImageSize: naps.Length,
                 nestedMetaBaseBlocks: nestedMetaBaseBlocks,
-                contentVersionHi: 0x01000000,
+                contentVersionHi: contentVersionHi,
                 innerContentInodes: innerResult.InnerContentInodes,
                 appFileCount: innerResult.AppFileCount,
                 metaBlockCount: fihMetaBlockCount,
@@ -673,7 +726,7 @@ public static class ProsperoDebugPackageBuilder
 
             ProsperoFihBuilder.BuildFromCntToFile(
                 cntPath, output, FihVariant.Debug, outerBuild.SuperblockIndex,
-                nestedDigest, naps.Length, nestedMetaBaseBlocks, 0x01000000,
+                nestedDigest, naps.Length, nestedMetaBaseBlocks, contentVersionHi,
                 innerResult.InnerContentInodes, innerResult.AppFileCount,
                 fihMetaBlockCount, fihMetaBlockCountMirror, emptyFileCount, 0,
                 siFactory);
@@ -692,6 +745,18 @@ public static class ProsperoDebugPackageBuilder
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
         }
+    }
+
+    /// <summary>
+    /// Reverses each 32-byte digest on a copy: the on-disk imagedigs entry stores every per-block
+    /// digest byte-reversed (verified against the Sony fixture and the reference writer).
+    /// </summary>
+    private static byte[] ReverseDigests(byte[] digests)
+    {
+        byte[] reversed = (byte[])digests.Clone();
+        for (int off = 0; off + 32 <= reversed.Length; off += 32)
+            Array.Reverse(reversed, off, 32);
+        return reversed;
     }
 
     private static byte[] ReadStreamRange(Stream stream, long offset, int length)
@@ -951,43 +1016,58 @@ public static class ProsperoDebugPackageBuilder
         byte[]? applicationSceVersion = null;
         int ebootIndex = innerFiles.FindIndex(file =>
             string.Equals(file.Path, "/eboot.bin", StringComparison.Ordinal));
-        if (ebootIndex >= 0 &&
-            ProsperoSelfBuilder.TryGetSceVersionRecord(ReadInnerFileBytes(innerFiles[ebootIndex]), out byte[] ebootRecord))
+        if (ebootIndex >= 0)
         {
-            applicationSceVersion = ebootRecord;
+            try
+            {
+                if (ProsperoSelfBuilder.TryGetSceVersionRecord(ReadInnerFileBytes(innerFiles[ebootIndex]), out byte[] ebootRecord))
+                    applicationSceVersion = ebootRecord;
+            }
+            catch (Exception ex) when (ex is InvalidDataException or IOException)
+            {
+                console.Log($"  warning: could not read the eboot sceversion record ({ex.Message}).");
+            }
         }
 
         for (int i = 0; i < innerFiles.Count; i++)
         {
             ProsperoInnerImageAssembler.InnerFile file = innerFiles[i];
             // Fake-signing is the one transformation that may target file-backed sources, so read
-            // the payload here and replace the entry with an in-memory transformed result.
+            // the payload here and replace the entry with an in-memory transformed result. A module
+            // that cannot be converted is packed unchanged with a warning instead of failing the build.
             if (!IsFakeSignTarget(file.Path))
                 continue;
-            byte[] source = ReadInnerFileBytes(file);
-            if (!ProsperoSelfBuilder.IsElf(source))
-                continue;
-
-            FselfOptions? options = null;
-            if (!string.Equals(file.Path, "/eboot.bin", StringComparison.Ordinal) &&
-                applicationSceVersion is not null &&
-                !ProsperoSelfBuilder.TryGetSceVersionRecord(source, out _))
+            try
             {
-                options = new FselfOptions
+                byte[] source = ReadInnerFileBytes(file);
+                if (!ProsperoSelfBuilder.IsElf(source))
+                    continue;
+
+                FselfOptions? options = null;
+                if (!string.Equals(file.Path, "/eboot.bin", StringComparison.Ordinal) &&
+                    applicationSceVersion is not null &&
+                    !ProsperoSelfBuilder.TryGetSceVersionRecord(source, out _))
                 {
-                    SceVersionName = Path.GetFileNameWithoutExtension(file.Path),
-                    SceVersionRecord = applicationSceVersion,
-                };
-            }
+                    options = new FselfOptions
+                    {
+                        SceVersionName = Path.GetFileNameWithoutExtension(file.Path),
+                        SceVersionRecord = applicationSceVersion,
+                    };
+                }
 
-            byte[] signed = ProsperoSelfBuilder.MakeFself(source, options);
-            innerFiles[i] = new ProsperoInnerImageAssembler.InnerFile
+                byte[] signed = ProsperoSelfBuilder.MakeFself(source, options);
+                innerFiles[i] = new ProsperoInnerImageAssembler.InnerFile
+                {
+                    Path = file.Path,
+                    Data = signed,
+                    PlayGoChunkId = file.PlayGoChunkId,
+                };
+                console.Log($"  Fake-signed module: {file.Path} ({source.Length} -> {signed.Length} bytes)");
+            }
+            catch (Exception ex) when (ex is InvalidDataException or IOException or ArgumentException or NotSupportedException)
             {
-                Path = file.Path,
-                Data = signed,
-                PlayGoChunkId = file.PlayGoChunkId,
-            };
-            console.Log($"  Fake-signed module: {file.Path} ({source.Length} -> {signed.Length} bytes)");
+                console.Log($"  warning: could not fake-sign {file.Path}: {ex.Message}; packing it unchanged.");
+            }
         }
     }
 

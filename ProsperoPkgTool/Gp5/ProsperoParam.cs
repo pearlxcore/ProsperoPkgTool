@@ -39,8 +39,8 @@ public static partial class ProsperoParamReader
         ArgumentNullException.ThrowIfNull(stream);
         var options = new JsonDocumentOptions
         {
-            AllowTrailingCommas = false,
-            CommentHandling = JsonCommentHandling.Disallow,
+            AllowTrailingCommas = true,
+            CommentHandling = JsonCommentHandling.Skip,
             MaxDepth = 64,
         };
         using JsonDocument document = JsonDocument.Parse(stream, options);
@@ -48,33 +48,36 @@ public static partial class ProsperoParamReader
         if (root.ValueKind != JsonValueKind.Object)
             throw new InvalidDataException("param.json root must be an object.");
 
-        string titleId = RequiredString(root, "titleId");
-        string contentId = RequiredString(root, "contentId");
-        string? contentVersion = OptionalString(root, "contentVersion");
-        int category = OptionalInt(root, "applicationCategoryType") ?? 0;
-        string? applicationDrmType = OptionalString(root, "applicationDrmType");
-        string? creationDate = null;
-        if (root.TryGetProperty("pubtools", out JsonElement pubtools))
-        {
-            if (pubtools.ValueKind != JsonValueKind.Object)
-                throw new InvalidDataException("param.json pubtools must be an object.");
-            creationDate = OptionalString(pubtools, "creationDate");
-        }
-
-        if (!TitleIdRegex().IsMatch(titleId))
-            throw new InvalidDataException("param.json titleId must use the nine-character PPSA/PPSX form.");
+        string? contentId = OptionalString(root, "contentId");
+        if (string.IsNullOrWhiteSpace(contentId))
+            throw new InvalidDataException("param.json is missing string property 'contentId'.");
+        contentId = contentId.Trim().ToUpperInvariant();
         if (!ContentIdRegex().IsMatch(contentId))
-            throw new InvalidDataException("param.json contentId must use the 36-character Sony content ID form.");
-        if (!contentId.AsSpan(7, 9).Equals(titleId, StringComparison.Ordinal))
-            throw new InvalidDataException("param.json contentId does not contain its titleId.");
+            throw new InvalidDataException(
+                $"param.json contentId '{contentId}' must use the 36-character Sony content ID form.");
+
+        // The title id is derived from the content id whenever it is absent, malformed or stale. The
+        // console keys the title off the content id, and real dumps occasionally carry an edited
+        // content id with an old title id (or a different letter case).
+        string? titleId = OptionalString(root, "titleId");
+        titleId = string.IsNullOrWhiteSpace(titleId) ? contentId[7..16] : titleId.Trim().ToUpperInvariant();
+        if (!TitleIdRegex().IsMatch(titleId))
+            titleId = contentId[7..16];
+
+        string? contentVersion = OptionalString(root, "contentVersion");
         // Real dumps carry publisher-specific category encodings (for example 0x01000000) that Sony's
         // tooling overwrites with 0. Only 1 selects additional content; every other value is treated
         // as a base application, matching the reference builder's CategoryTypeForMode.
+        int category = OptionalInt(root, "applicationCategoryType") ?? 0;
         if (category != 1)
             category = 0;
-        if (applicationDrmType is not null &&
-            applicationDrmType is not "standard" and not "free" and not "freemium")
-            throw new InvalidDataException("applicationDrmType must be standard, free, or freemium.");
+        // The DRM token is descriptive metadata packaged verbatim; the CNT policy and the SI XML
+        // handle any token, so it is not restricted here.
+        string? applicationDrmType = OptionalString(root, "applicationDrmType");
+
+        string? creationDate = null;
+        if (root.TryGetProperty("pubtools", out JsonElement pubtools) && pubtools.ValueKind == JsonValueKind.Object)
+            creationDate = OptionalString(pubtools, "creationDate");
 
         return new ProsperoParam(titleId, contentId, contentVersion, category, creationDate, applicationDrmType)
         {
@@ -82,26 +85,18 @@ public static partial class ProsperoParamReader
         };
     }
 
-    private static string RequiredString(JsonElement parent, string name) =>
-        OptionalString(parent, name) is { Length: > 0 } value
-            ? value
-            : throw new InvalidDataException($"param.json is missing string property '{name}'.");
-
     private static string? OptionalString(JsonElement parent, string name)
     {
-        if (!parent.TryGetProperty(name, out JsonElement value))
+        if (!parent.TryGetProperty(name, out JsonElement value) || value.ValueKind != JsonValueKind.String)
             return null;
-        if (value.ValueKind != JsonValueKind.String)
-            throw new InvalidDataException($"param.json property '{name}' must be a string.");
         return value.GetString();
     }
 
     private static int? OptionalInt(JsonElement parent, string name)
     {
-        if (!parent.TryGetProperty(name, out JsonElement value))
+        if (!parent.TryGetProperty(name, out JsonElement value) || value.ValueKind != JsonValueKind.Number ||
+            !value.TryGetInt32(out int result))
             return null;
-        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out int result))
-            throw new InvalidDataException($"param.json property '{name}' must be an integer.");
         return result;
     }
 

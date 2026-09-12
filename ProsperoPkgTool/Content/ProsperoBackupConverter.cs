@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 
 namespace ProsperoPkgTool.Content;
 
@@ -216,6 +217,11 @@ public static class ProsperoBackupConverter
         foreach (string rel in unresolved)
             warnings.Add($"Module '{rel}' is signed with no decrypted copy; it is packed unchanged and will not run.");
 
+        // The package content id and param.json must agree: the console derives the title id from the
+        // content id, so a stale or overridden titleId would make the packaged metadata inconsistent.
+        // Repair the staged copy only (the backup is never touched).
+        RepairParamIdentity(staging, contentId, log, warnings);
+
         ProsperoLaunchReadinessReport readiness = ProsperoLaunchReadiness.InspectAppRoot(staging);
 
         return new ProsperoBackupStagingResult
@@ -260,8 +266,22 @@ public static class ProsperoBackupConverter
             log($"Building debug package for {staging.ContentId} from the assembled tree.");
             string outputPath = build(staging);
 
-            // Read the assembled tree back against the launch conditions while it is still present.
-            ProsperoLaunchReadinessReport readiness = ProsperoLaunchReadiness.InspectAppRoot(staging.StagingFolder);
+            // The build callback may legitimately remove or move the assembled tree, and a very long
+            // build can be disrupted externally. Readiness was already computed on the same tree by
+            // Stage, so fall back to that report instead of failing a conversion whose package has
+            // already been written.
+            ProsperoLaunchReadinessReport readiness;
+            if (Directory.Exists(staging.StagingFolder))
+            {
+                readiness = ProsperoLaunchReadiness.InspectAppRoot(staging.StagingFolder);
+            }
+            else
+            {
+                warnings.Add(
+                    $"The staging tree '{staging.StagingFolder}' is no longer present after the build; " +
+                    "reusing the launch-readiness report captured before the build.");
+                readiness = staging.LaunchReadiness;
+            }
 
             return new ProsperoBackupConversionResult
             {
@@ -419,26 +439,75 @@ public static class ProsperoBackupConverter
         return new string(buffer);
     }
 
-    private readonly record struct ParamMeta(string ContentId, string Version);
+    /// <summary>
+    /// Aligns the staged <c>sce_sys/param.json</c> contentId/titleId with the effective package
+    /// content id. A backup whose metadata was edited (for example a swapped contentId with a stale
+    /// titleId) would otherwise be rejected by the param.json invariant before the build. Only the
+    /// staged copy is rewritten; the source backup is never modified.
+    /// </summary>
+    private static void RepairParamIdentity(string staging, string contentId, Action<string> log, List<string> warnings)
+    {
+        if (contentId.Length != 36)
+            return;
+        string paramPath = Path.Combine(staging, "sce_sys", "param.json");
+        if (!File.Exists(paramPath))
+            return;
+        string text;
+        try { text = File.ReadAllText(paramPath); }
+        catch (IOException) { return; }
+
+        string expectedTitle = contentId.Substring(7, 9);
+        string updated = ReplaceStringField(text, "contentId", contentId, "content id", log, warnings);
+        updated = ReplaceStringField(updated, "titleId", expectedTitle, "title id", log, warnings);
+        if (updated == text)
+            return;
+
+        try
+        {
+            File.WriteAllText(paramPath, updated, new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        }
+        catch (IOException ex)
+        {
+            warnings.Add($"Could not rewrite the staged param.json identity fields: {ex.Message}");
+        }
+    }
+
+    // Replaces the JSON string value of one field when it differs. Done textually so the rest of the
+    // publisher document is preserved.
+    private static string ReplaceStringField(string json, string field, string value, string label,
+        Action<string> log, List<string> warnings)
+    {
+        Match match = Regex.Match(json, "\"" + Regex.Escape(field) + "\"\\s*:\\s*\"([^\"]*)\"");
+        if (!match.Success || match.Groups[1].Value == value)
+            return json;
+        log($"Updated staged param.json {label}: '{match.Groups[1].Value}' -> '{value}'.");
+        warnings.Add(
+            $"param.json {label} '{match.Groups[1].Value}' did not match the package content id; " +
+            $"the staged copy was updated to '{value}'.");
+        return json[..match.Groups[1].Index] + value + json[(match.Groups[1].Index + match.Groups[1].Length)..];
+    }
+
+    private readonly record struct ParamMeta(string ContentId, string Version, string TitleId);
 
     private static ParamMeta ReadParamMeta(string paramPath)
     {
         if (!File.Exists(paramPath))
-            return new ParamMeta("", "");
+            return new ParamMeta("", "", "");
         try
         {
             var root = JsonNode.Parse(File.ReadAllText(paramPath)) as JsonObject;
             if (root is null)
-                return new ParamMeta("", "");
+                return new ParamMeta("", "", "");
             string cid = root.TryGetPropertyValue("contentId", out JsonNode? c) && c is JsonValue cv && cv.TryGetValue(out string? cs) ? cs ?? "" : "";
             string ver = "";
             if (root.TryGetPropertyValue("contentVersion", out JsonNode? cvn) && cvn is JsonValue cvv && cvv.TryGetValue(out string? cvs) && !string.IsNullOrWhiteSpace(cvs))
                 ver = cvs!;
             else if (root.TryGetPropertyValue("masterVersion", out JsonNode? mvn) && mvn is JsonValue mvv && mvv.TryGetValue(out string? mvs))
                 ver = mvs ?? "";
-            return new ParamMeta(cid, ver);
+            string title = root.TryGetPropertyValue("titleId", out JsonNode? t) && t is JsonValue tv && tv.TryGetValue(out string? ts) ? ts ?? "" : "";
+            return new ParamMeta(cid, ver, title);
         }
-        catch (JsonException) { return new ParamMeta("", ""); }
-        catch (IOException) { return new ParamMeta("", ""); }
+        catch (JsonException) { return new ParamMeta("", "", ""); }
+        catch (IOException) { return new ParamMeta("", "", ""); }
     }
 }

@@ -24,49 +24,62 @@ public static class ProsperoPlayGoRecordBuilder
         ArgumentNullException.ThrowIfNull(inner);
         var files = inner.Nodes.Where(n => !n.IsDirectory && n.FullPath.Length != 0).ToList();
         if (files.Count == 0)
-            throw new InvalidDataException("The finalized inner image has no byte-backed file leaves.");
+            return [];
 
         var normalizedAssignments = new Dictionary<string, byte>(StringComparer.Ordinal);
         if (chunkAssignments is not null)
         {
             foreach ((string path, byte chunk) in chunkAssignments)
-                normalizedAssignments.Add(NormalizePath(path), chunk);
+                normalizedAssignments[NormalizePath(path)] = chunk;
         }
 
         var known = new HashSet<string>(files.Select(f => NormalizePath(f.FullPath)), StringComparer.Ordinal);
-        foreach (string path in normalizedAssignments.Keys)
-            if (!known.Contains(path))
-                throw new InvalidDataException($"PlayGo chunk assignment names no finalized inner-PFS leaf: '{path}'.");
-
         var result = new List<ProsperoPlayGoFileRecord>(files.Count);
         foreach (ProsperoInnerImageAssembler.MetaNodeInfo file in files)
         {
             string path = NormalizePath(file.FullPath);
+            // An assignment that names no leaf is stale dump data, not a build error: the leaf keeps
+            // the default chunk zero, exactly as if it were absent from the assignment vocabulary.
             byte chunk = normalizedAssignments.TryGetValue(path, out byte value) ? value : (byte)0;
             result.Add(new ProsperoPlayGoFileRecord(path, chunk, ProsperoOuterPfsBuilder.FltPathHash(path)));
         }
 
         result.Sort((a, b) => a.PathHash.CompareTo(b.PathHash));
-        if (result.Select(r => r.PathHash).Distinct().Count() != result.Count)
-            throw new InvalidDataException("Supported PlayGo leaves have colliding path hashes.");
-        return result;
+        // Duplicate hashes cannot be represented in the hash-sorted table; keep the first occurrence
+        // (the population is advisory metadata, so a colliding leaf is dropped, not fatal).
+        var unique = new List<ProsperoPlayGoFileRecord>(result.Count);
+        foreach (ProsperoPlayGoFileRecord record in result)
+        {
+            if (unique.Count > 0 && unique[^1].PathHash == record.PathHash)
+                continue;
+            unique.Add(record);
+        }
+        return unique;
     }
 
+    /// <summary>
+    /// Normalizes an inner path for the PlayGo vocabulary: forward slashes, leading slash removed,
+    /// uppercased, with non-ASCII characters replaced by '?'. It never throws for odd dump paths.
+    /// </summary>
     public static string NormalizePath(string path)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
         string value = path.Replace('\\', '/').TrimStart('/');
-        if (value.Length == 0 || value.Split('/').Any(p => p.Length == 0 || p is "." or ".."))
-            throw new InvalidDataException($"Invalid inner-PFS PlayGo path '{path}'.");
-        Span<char> chars = stackalloc char[value.Length];
-        for (int i = 0; i < value.Length; i++)
+        var chars = new List<char>(value.Length);
+        foreach (char c in value)
         {
-            char c = value[i];
-            if (c > 0x7f)
-                throw new InvalidDataException("Supported PlayGo paths must be ASCII.");
-            chars[i] = c is >= 'a' and <= 'z' ? (char)(c - ('a' - 'A')) : c;
+            if (c == '/')
+            {
+                if (chars.Count > 0 && chars[^1] != '/')
+                    chars.Add('/');
+                continue;
+            }
+            char upper = c is >= 'a' and <= 'z' ? (char)(c - ('a' - 'A')) : c;
+            chars.Add(upper <= 0x7f ? upper : '?');
         }
-        return new string(chars);
+        while (chars.Count > 0 && chars[^1] == '/')
+            chars.RemoveAt(chars.Count - 1);
+        return new string(chars.ToArray());
     }
 }
 

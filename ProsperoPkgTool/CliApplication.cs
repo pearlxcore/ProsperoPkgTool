@@ -682,7 +682,7 @@ public static class CliApplication
         string? contentId = null;
         string? gp5Path = null;
         string? requestedType = null;
-        ProsperoInnerCompressionMode compressionMode = ProsperoInnerCompressionMode.Stored;
+        ProsperoInnerCompressionMode compressionMode = ProsperoInnerCompressionMode.Auto;
         string passcode = Gp5Constants.DefaultPasscode;
         bool passcodeProvided = false;
         bool noPasscode = false;
@@ -1234,19 +1234,30 @@ public static class CliApplication
     private static int RunInnerImageVerify(string[] args)
     {
         string? package = null, passcode = null, referencePackage = null;
+        bool strict = false;
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--passcode" && i + 1 < args.Length) passcode = args[++i];
             else if (args[i] == "--ref_pkg_path" && i + 1 < args.Length) referencePackage = args[++i];
             else if (args[i] == "--no_passcode") { }
+            else if (args[i] == "--strict") strict = true;
             else if (args[i].StartsWith("--", StringComparison.Ordinal)) return UnknownOption(args[i]);
             else package ??= args[i];
         }
-        if (package is null) { Console.Error.WriteLine("Usage: ProsperoPkgTool img_verify [--ref_pkg_path <reference.pkg>] [--passcode <passcode>|--no_passcode] <package>"); return 2; }
+        if (package is null) { Console.Error.WriteLine("Usage: ProsperoPkgTool img_verify [--ref_pkg_path <reference.pkg>] [--passcode <passcode>|--no_passcode] [--strict] <package>"); return 2; }
         ProsperoPackageVerificationReport report = ProsperoPackageVerifier.Verify(package, passcode, referencePackage);
         foreach (VerificationCheck check in report.Checks)
             Console.WriteLine($"{check.State.ToString().ToUpperInvariant(),-11} {check.Name}: {check.Detail}");
-        return report.HasFailure ? 4 : 0;
+        int pass = report.Checks.Count(c => c.State == VerificationState.Pass);
+        int fail = report.Checks.Count(c => c.State == VerificationState.Fail);
+        int unavailable = report.Checks.Count(c => c.State == VerificationState.Unavailable);
+        int notPresent = report.Checks.Count(c => c.State == VerificationState.NotPresent);
+        Console.WriteLine($"Summary: {pass} pass, {fail} fail, {unavailable} unavailable, {notPresent} not present.");
+        if (unavailable > 0)
+            Console.WriteLine("Verification is incomplete: unavailable checks were not independently proven (use --strict to fail on this).");
+        if (report.HasFailure)
+            return 4;
+        return strict && unavailable > 0 ? 6 : 0;
     }
 
     private static void PrintParamSummary(string packagePath, ProsperoPackageInspection package)

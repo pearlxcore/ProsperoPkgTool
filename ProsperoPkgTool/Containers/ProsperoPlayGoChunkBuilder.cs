@@ -71,6 +71,28 @@ public static class ProsperoPlayGoChunkBuilder
         for (int i = 0; i < extents.Count; i++)
             extentIds[extents[i].ChunkId].Add((uint)i);
 
+        // The observed debug/nwonly container carries a fixed single-chunk/single-scenario profile
+        // with two mchunk regions tiling the mount image up to cnt_offset. Byte-verified against the
+        // Sony fixture; richer projects keep the variable-length extent serializer below.
+        if (project.Chunks.Count == 1 && project.Scenarios.Count == 1)
+        {
+            long innerSize = inner.ImageSize;
+            long aligned = innerSize <= 0
+                ? 0
+                : (innerSize + OuterBlockSize - 1) / OuterBlockSize * OuterBlockSize;
+            ulong total = fihCntOffset;
+            ulong mchunk0 = aligned > 0 && (ulong)aligned < total
+                ? (ulong)aligned
+                : total - (ulong)OuterBlockSize;
+            ulong mchunk1 = total - mchunk0;
+            return new ProsperoPlayGoChunkBuildResult
+            {
+                Data = BuildSingleChunkProfile(contentId, project.Chunks[0].LanguageMask, mchunk0, mchunk1),
+                Extents = extents,
+                ChunkExtentIds = extentIds,
+            };
+        }
+
         byte[] chunkLabels = EncodeLabels(project.Chunks.Select(c => c.Label));
         byte[] scenarioLabels = EncodeLabels(project.Scenarios.Select(s => s.Label));
         int c8Size = checked(extents.Count * sizeof(uint));
@@ -127,6 +149,52 @@ public static class ProsperoPlayGoChunkBuilder
         }
         scenarioLabels.CopyTo(data.AsSpan(f0));
         return new ProsperoPlayGoChunkBuildResult { Data = data, Extents = extents, ChunkExtentIds = extentIds };
+    }
+
+    /// <summary>
+    /// Serializes the fixed 0x1A0-byte single-chunk PLGX profile the debug/nwonly containers carry
+    /// (byte-verified against the Sony fixture): one chunk, one scenario, one image, and two mchunk
+    /// regions tiling the mount image up to cnt_offset.
+    /// </summary>
+    private static byte[] BuildSingleChunkProfile(string contentId, ulong languageMask, ulong mchunk0, ulong mchunk1)
+    {
+        byte[] d = new byte[0x1A0];
+        BinaryPrimitives.WriteUInt32LittleEndian(d, Magic);
+        BinaryPrimitives.WriteUInt16LittleEndian(d.AsSpan(4), 0x1000);
+        BinaryPrimitives.WriteUInt16LittleEndian(d.AsSpan(8), 1);
+        BinaryPrimitives.WriteUInt16LittleEndian(d.AsSpan(0xa), 1);
+        BinaryPrimitives.WriteUInt16LittleEndian(d.AsSpan(0xe), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(d.AsSpan(0x10), 0x1A0);
+        BinaryPrimitives.WriteUInt16LittleEndian(d.AsSpan(0x16), 1);
+        d[0x1e] = 0x85;
+        d[0x20] = 0x02;
+        d[0x24] = 0x01;
+        d[0x30] = 0x11;
+        d.AsSpan(0x38, 8).Fill(0xFF);
+        Encoding.ASCII.GetBytes(contentId).CopyTo(d.AsSpan(0x40));
+        WriteSection(d, 0xc0, 0x100, 0x20);
+        WriteSection(d, 0xc8, 0x120, 0x08);
+        WriteSection(d, 0xd0, 0x130, 0x09);
+        WriteSection(d, 0xd8, 0x140, 0x20);
+        WriteSection(d, 0xe0, 0x160, 0x20);
+        WriteSection(d, 0xe8, 0x180, 0x02);
+        WriteSection(d, 0xf0, 0x190, 0x0c);
+        d[0x100] = 0x80;
+        d[0x102] = 0x03;
+        d[0x104] = 0x02;
+        d[0x108] = 0x11;
+        BinaryPrimitives.WriteUInt64LittleEndian(d.AsSpan(0x110), languageMask);
+        BinaryPrimitives.WriteUInt32LittleEndian(d.AsSpan(0x124), 1);
+        Encoding.ASCII.GetBytes("Chunk #0\0").CopyTo(d.AsSpan(0x130));
+        BinaryPrimitives.WriteUInt64LittleEndian(d.AsSpan(0x140), 0);
+        BinaryPrimitives.WriteUInt64LittleEndian(d.AsSpan(0x148), mchunk0);
+        BinaryPrimitives.WriteUInt64LittleEndian(d.AsSpan(0x150), mchunk0);
+        BinaryPrimitives.WriteUInt64LittleEndian(d.AsSpan(0x158), mchunk1);
+        BinaryPrimitives.WriteUInt64LittleEndian(d.AsSpan(0x160), 0x21);
+        d[0x174] = 1;
+        d[0x176] = 1;
+        Encoding.ASCII.GetBytes("Scenario #0\0").CopyTo(d.AsSpan(0x190));
+        return d;
     }
 
     private static List<ProsperoPlayGoExtent> DeriveExtents(IReadOnlyList<PhysicalLeaf> leaves,

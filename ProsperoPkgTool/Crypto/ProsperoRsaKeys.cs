@@ -126,14 +126,12 @@ public static class ProsperoRsaKeys
         Sha3.Sha3_256(cid).CopyTo(entry.AsSpan(off));
         off += 32;
 
-        // Per-key digests (7 × 32): SHA3-256(key) XOR key for each passcode-derived key.
-        // Index 0's key is the raw passcode ASCII (32 bytes).
+        // Per-key digests (7 × 32): SHA3-256(Ki) XOR Ki for the seven derived package keys. The
+        // digest for index 0 uses the derived K0 (fixture-verified); only the RSA *wrap* below keeps
+        // the raw passcode as the passcode-recovery slot.
         for (int i = 0; i < PasscodeModulusCount; i++)
         {
-            byte[] key = i == 0
-                ? Encoding.ASCII.GetBytes(passcode)
-                : ProsperoKeys.ComputeKeys(contentId, passcode, (uint)i, useSha3: true);
-
+            byte[] key = ProsperoKeys.ComputeKeys(contentId, passcode, (uint)i, useSha3: true);
             byte[] digest = Sha3.Sha3_256(key);
             for (int j = 0; j < 32; j++)
                 digest[j] ^= key[j];

@@ -154,8 +154,15 @@ public static class ProsperoUcpArchive
     /// </summary>
     public static byte[] RepairIfNeeded(byte[] data)
     {
-        if (IsUcp(data) && !VerifyDigest(data))
-            return WithRepairedDigest(data);
+        try
+        {
+            if (IsUcp(data) && !VerifyDigest(data))
+                return WithRepairedDigest(data);
+        }
+        catch (InvalidDataException)
+        {
+            // A malformed archive is packed unchanged; the repair is best-effort.
+        }
         return data;
     }
 

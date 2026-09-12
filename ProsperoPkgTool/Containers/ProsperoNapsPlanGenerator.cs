@@ -102,13 +102,18 @@ public static class ProsperoNapsPlanGenerator
         if (padding > 0)
         {
             int holeCount = (int)((padding + UBlock - 1) / UBlock);
-            long holeOnDisk = inner.BlockInfoOnDiskOffset;
+            long holeBase = inner.BlockInfoOnDiskOffset;
+            long holeCursor = holeBase;
             for (int k = 0; k < holeCount; k++)
             {
+                bool last = k == holeCount - 1;
+                // Every deduped padding block is emitted at the block-info block and re-anchored by
+                // its own RUN, except the last one, which continues the cursor (fixture-verified).
+                long onDisk = last ? holeCursor : holeBase;
                 bool full = Math.Min(UBlock, padding - (long)k * UBlock) > 0x20000;
                 long stream = full ? 16L : 8L;
-                emitter.EmitHole(holeOnDisk, inner.DataEndLogical + (long)k * UBlock, stream, full);
-                holeOnDisk += stream;
+                emitter.EmitHole(onDisk, inner.DataEndLogical + (long)k * UBlock, stream, full, startRun: !last);
+                holeCursor = onDisk + stream;
             }
         }
 
@@ -284,11 +289,11 @@ public static class ProsperoNapsPlanGenerator
             return (even, odd);
         }
 
-        public void EmitHole(long onDisk, long logical, long stream, bool full)
+        public void EmitHole(long onDisk, long logical, long stream, bool full, bool startRun)
         {
             Emit(new NapsCblockPlanEntry
             {
-                StartRun = NeedsRun(onDisk),
+                StartRun = startRun || NeedsRun(onDisk),
                 OnDiskOffset = onDisk,
                 LogicalOffset = logical,
                 EvenChunkCompressedLength = 8,
