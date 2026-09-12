@@ -94,7 +94,8 @@ public static class Gp5Generator
             {
                 Id = chunk.Id,
                 Label = chunk.Label,
-                Languages = $"0x{chunk.LanguageMask:X16}",
+                // The GP5 <chunk> `languages` attribute is a space-separated language-tag list; the
+                // known-good publisher project omits it, so the binary language mask is not emitted.
             });
         }
         foreach (PlayGoScenario scenario in playGo.Scenarios)

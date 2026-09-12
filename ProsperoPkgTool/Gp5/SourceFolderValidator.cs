@@ -107,7 +107,7 @@ public static class SourceFolderValidator
         if (lower is "sce_sys/playgo-chunk.dat" or "sce_sys/playgo-ficm.dat" or
             "sce_sys/playgo-hash-table.dat" or "sce_sys/imagedigs.dat" or
             "sce_sys/pfs-version.dat" or "sce_sys/keystone" or
-            "sce_sys/npbind.dat" or
+            "sce_sys/npbind.dat" or "sce_sys/nptitle.dat" or
             "sce_sys/ext_info.dat" or "disc_info.dat")
             return true;
 
