@@ -52,28 +52,32 @@ public sealed class AesXts : IDisposable
         Span<byte> sectorBytes = stackalloc byte[16];
         BinaryPrimitives.WriteUInt64LittleEndian(sectorBytes, sector);
         // upper 8 bytes remain zero (PFS sector indexes fit in 64 bits)
-        byte[] tweak = _tweakCipher.EncryptEcb(sectorBytes.ToArray(), PaddingMode.None);
+        byte[] tweak = _tweakCipher.EncryptEcb(sectorBytes, PaddingMode.None);
 
-        byte[] output = new byte[input.Length];
-        Span<byte> blockIn = stackalloc byte[16];
-        Span<byte> blockOut = stackalloc byte[16];
-
+        // XTS: C_i = E(P_i xor T_i) xor T_i. ECB transforms every 16-byte block independently, so the
+        // whole data unit can be xored with the tweak sequence and transformed in ONE AES call
+        // instead of one call (and two allocations) per 16-byte block.
+        byte[] work = new byte[input.Length];
+        byte[] current = (byte[])tweak.Clone();
         for (int i = 0; i < input.Length; i += 16)
         {
-            // XOR with the running tweak, transform, XOR again.
             for (int j = 0; j < 16; j++)
-                blockIn[j] = (byte)(input[i + j] ^ tweak[j]);
+                work[i + j] = (byte)(input[i + j] ^ current[j]);
+            MultiplyTweakByX(current);
+        }
 
-            ReadOnlySpan<byte> src = blockIn;
-            byte[] transformed = encrypt
-                ? _dataCipher.EncryptEcb(src.ToArray(), PaddingMode.None)
-                : _dataCipher.DecryptEcb(src.ToArray(), PaddingMode.None);
-            transformed.AsSpan(0, 16).CopyTo(blockOut);
+        byte[] output = new byte[input.Length];
+        if (encrypt)
+            _dataCipher.EncryptEcb(work, output, PaddingMode.None);
+        else
+            _dataCipher.DecryptEcb(work, output, PaddingMode.None);
 
+        current = (byte[])tweak.Clone();
+        for (int i = 0; i < input.Length; i += 16)
+        {
             for (int j = 0; j < 16; j++)
-                output[i + j] = (byte)(blockOut[j] ^ tweak[j]);
-
-            MultiplyTweakByX(tweak);
+                output[i + j] ^= current[j];
+            MultiplyTweakByX(current);
         }
         return output;
     }

@@ -598,6 +598,7 @@ public static class ProsperoDebugPackageBuilder
             ProsperoCompressionMetrics compression = innerResult.CompressionMetrics;
             console.Log($"  Inner payload: {compression.RawBytes} raw -> {compression.EncodedBytes} encoded; " +
                 $"Kraken {compression.KrakenBlocks}, stored {compression.StoredBlocks}, ratio {compression.Ratio:P2}");
+            LogStage(stageClock, console, ProsperoBuildStage.InnerImage);
 
             ProsperoNapsPlanGenerator.PlanResult napsPlan = ProsperoNapsPlanGenerator.Generate(innerResult);
             byte[] naps = ProsperoNapsLayoutBuilder.Build(napsPlan.ToRequest(

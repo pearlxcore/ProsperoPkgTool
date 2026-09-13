@@ -39,6 +39,20 @@ public static class Sha3
 
     public static byte[] Sha3_256(ReadOnlySpan<byte> data)
     {
+        // Prefer the platform SHA3-256 (native, an order of magnitude faster); the clean-room Keccak
+        // below is the fallback on platforms without an OS/BCL implementation. Both emit the identical
+        // FIPS 202 digest.
+        if (System.Security.Cryptography.SHA3_256.IsSupported)
+        {
+            byte[] digest = new byte[DigestSizeBytes];
+            System.Security.Cryptography.SHA3_256.HashData(data, digest);
+            return digest;
+        }
+        return ManagedSha3_256(data);
+    }
+
+    private static byte[] ManagedSha3_256(ReadOnlySpan<byte> data)
+    {
         Span<byte> state = stackalloc byte[StateSizeBytes];
         state.Clear();
 
@@ -74,6 +88,8 @@ public static class Sha3
     public static byte[] Sha3_256(Stream stream)
     {
         ArgumentNullException.ThrowIfNull(stream);
+        if (System.Security.Cryptography.SHA3_256.IsSupported)
+            return System.Security.Cryptography.SHA3_256.HashData(stream);
         var state = new Sha3StreamState();
         byte[] buffer = new byte[1 << 20];
         int read;

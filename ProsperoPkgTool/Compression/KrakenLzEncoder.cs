@@ -56,12 +56,7 @@ internal static class KrakenLzEncoder
         int n = data.Length;
         int[] head = t_head ??= new int[HashSize];
         Array.Fill(head, -1);
-        int[] prev = t_prev;
-        if (prev is null || prev.Length < n)
-        {
-            prev = new int[n];
-            t_prev = prev;
-        }
+        int[] prev = t_prev is { } cached && cached.Length >= n ? cached : (t_prev = new int[n]);
         int nextInsert = 0;
 
         int firstEnd = Math.Min(n, ChunkSize);
