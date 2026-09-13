@@ -279,6 +279,33 @@ public static class ProsperoSiArchive
     }
 
     /// <summary>
+    /// Reads <paramref name="length"/> bytes once and returns both the SHA3-256 digest of the whole
+    /// image and the per-64-KiB CRC-32C table, so the SI builder does not traverse the multi-gigabyte
+    /// mount image twice.
+    /// </summary>
+    private static (byte[] Digest, byte[] ChunkCrc) HashAndChunkCrc(Stream stream, long length)
+    {
+        int blockCount = checked((int)((length + ChunkCrcBlockSize - 1) / ChunkCrcBlockSize));
+        byte[] crc = new byte[blockCount * 4];
+        byte[] buffer = new byte[ChunkCrcBlockSize];
+        using var sha = System.Security.Cryptography.IncrementalHash.CreateHash(
+            System.Security.Cryptography.HashAlgorithmName.SHA3_256);
+        long remaining = length;
+        int index = 0;
+        while (remaining > 0)
+        {
+            int len = (int)Math.Min(ChunkCrcBlockSize, remaining);
+            int read = ReadFully(stream, buffer, len);
+            sha.AppendData(buffer.AsSpan(0, read));
+            uint value = ProsperoCrc32C.Compute(buffer.AsSpan(0, read));
+            BinaryPrimitives.WriteUInt32LittleEndian(crc.AsSpan(index * 4), value);
+            remaining -= read;
+            index++;
+        }
+        return (sha.GetHashAndReset(), crc);
+    }
+
+    /// <summary>
     /// Streaming counterpart of <see cref="BuildDebugSiSegment"/> for a file-backed mount image.
     /// The <c>naps_meta_18</c> root/outer digests (<c>rhsh</c>/<c>obdg</c>) and the
     /// <c>playgo-chunk.crc</c> table are computed from <paramref name="mountStream"/> (+ the supplied
@@ -301,8 +328,18 @@ public static class ProsperoSiArchive
         if (innerImageSize >= ProsperoNapsMeta.PfsBlockSizeConst)
             napsMeta300 = ProsperoNapsMeta.BuildMeta300FromInnerImageSize(innerImageSize);
 
+        // A single pass over the mount image yields both the ordered block digest (obdg SHA3) and the
+        // playgo-chunk.crc table; this used to read the whole image twice.
+        byte[]? obdgDigest = null;
+        byte[]? chunkCrc = null;
+        if (mountLength > 0)
+        {
+            mountStream.Position = 0;
+            (obdgDigest, chunkCrc) = HashAndChunkCrc(mountStream, mountLength);
+        }
+
         byte[]? napsMeta18 = null;
-        if (innerImageSize >= ProsperoNapsMeta.PfsBlockSizeConst && mountLength >= 0x10000)
+        if (obdgDigest is not null && innerImageSize >= ProsperoNapsMeta.PfsBlockSizeConst && mountLength >= 0x10000)
         {
             byte[]? rhshOverride = null;
             if (outerSuperblockBlock is { Length: > 0 })
@@ -313,8 +350,7 @@ public static class ProsperoSiArchive
             }
 
             var obdgBody = new byte[0x80];
-            mountStream.Position = 0;
-            ProsperoNapsMeta.Sha3Stream(mountStream).CopyTo(obdgBody);
+            obdgDigest.CopyTo(obdgBody, 0);
 
             byte[] blob = ProsperoNapsMeta.BuildMeta18WithMetadataEntry(
                 innerImageSize, default, contentFiles, pfsImageXml.PfsImageSize, pfsImageXml.NestedInner,
@@ -326,13 +362,6 @@ public static class ProsperoSiArchive
         byte[]? xmlBytes = includePfsImageXml
             ? Encoding.UTF8.GetBytes(BuildPfsImageXml(pfsImageXml, warnings))
             : null;
-
-        byte[]? chunkCrc = null;
-        if (mountLength > 0)
-        {
-            mountStream.Position = 0;
-            chunkCrc = BuildChunkCrc(mountStream, mountLength);
-        }
 
         IReadOnlyList<ProsperoSiMember> members = BuildMembers(
             pfsImageXml.ContentId,

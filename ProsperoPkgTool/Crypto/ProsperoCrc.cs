@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Runtime.Intrinsics.X86;
 
 namespace ProsperoPkgTool.Crypto;
 
@@ -94,9 +95,36 @@ public static class ProsperoCrc32C
     /// <summary>
     /// Continues a running CRC-32C over <paramref name="data"/>. Pass
     /// <see cref="uint.MaxValue"/> for a fresh checksum; the returned value is the internal
-    /// running register (NOT yet finalized).
+    /// running register (NOT yet finalized). Uses the SSE4.2 CRC32 instruction when available
+    /// (the instruction's Castagnoli/reflected convention matches this register), else slicing-by-8.
     /// </summary>
-    public static uint Update(uint crc, ReadOnlySpan<byte> data) => ReflectedCrc32.Update(crc, data, Tables);
+    public static uint Update(uint crc, ReadOnlySpan<byte> data)
+    {
+        if (Sse42.IsSupported)
+            return UpdateHardware(crc, data);
+        return ReflectedCrc32.Update(crc, data, Tables);
+    }
+
+    private static uint UpdateHardware(uint crc, ReadOnlySpan<byte> data)
+    {
+        uint c = crc;
+        int i = 0;
+        for (; i + 8 <= data.Length; i += 8)
+            c = (uint)Sse42.X64.Crc32(c, BinaryPrimitives.ReadUInt64LittleEndian(data[i..]));
+        if (i + 4 <= data.Length)
+        {
+            c = Sse42.Crc32(c, BinaryPrimitives.ReadUInt32LittleEndian(data[i..]));
+            i += 4;
+        }
+        if (i + 2 <= data.Length)
+        {
+            c = Sse42.Crc32(c, BinaryPrimitives.ReadUInt16LittleEndian(data[i..]));
+            i += 2;
+        }
+        if (i < data.Length)
+            c = Sse42.Crc32(c, data[i]);
+        return c;
+    }
 
     /// <summary>Computes the finalized standard CRC-32C of <paramref name="data"/>.</summary>
     public static uint Compute(ReadOnlySpan<byte> data) => ~Update(uint.MaxValue, data);
