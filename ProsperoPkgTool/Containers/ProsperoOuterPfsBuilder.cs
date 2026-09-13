@@ -460,82 +460,90 @@ public static class ProsperoOuterPfsBuilder
 
         var imageDigests = new byte[totalBlocks * 32];
 
-        // ---- 2. Hash every data block, parallelising the SHA3 work. ----
+        // Data-block SHA3 parallelism; the digest table is produced by the same pass that encrypts
+        // and writes the data (one read of the source, one read of the image).
         int parallelism = parameters.BlockParallelism <= 0
             ? Environment.ProcessorCount
             : Math.Clamp(parameters.BlockParallelism, 1, 256);
-        HashDataBlocks(files, fileFirstBlock, fileBlockCount, imageDigests, parallelism);
 
-        // ---- 3. Structural metadata blocks (in memory). ----
-        byte[] superRootBlock = new byte[BlockSize];
-        BuildSuperRootDirents(superRootBlock);
-        Sha3.Sha3_256(superRootBlock).CopyTo(imageDigests, superRootDirentIndex * 32);
+        // Structural metadata is assembled after the data write: the per-block digests it embeds are
+        // captured by the write pass, so it cannot be built before the data has been processed.
+        byte[] superblock;
+        byte[]? indirectRegion;
+        byte[] icv;
+        OuterBlockKind[] kinds;
 
-        byte[] fltBlock = new byte[BlockSize];
-        BuildFlatPathTableFromNames(fltBlock, files.Select(f => f.Name).ToArray());
-        Sha3.Sha3_256(fltBlock).CopyTo(imageDigests, fltIndex * 32);
-
-        byte[] urootBlock = new byte[BlockSize];
-        BuildUrootDirentsFromNames(urootBlock, files.Select(f => f.Name).ToArray());
-        Sha3.Sha3_256(urootBlock).CopyTo(imageDigests, urootDirentIndex * 32);
-
-        // Indirect tree blocks are serialized leaf-first; each block's plaintext SHA3 is recorded
-        // in the digest table (the data-block SHA3s were captured above).
-        byte[]? indirectRegion = indirectBlocksTotal > 0
-            ? new byte[checked(indirectBlocksTotal * BlockSize)] : null;
-        if (indirectRegion is not null)
-        {
-            for (int i = 0; i < files.Count; i++)
-            {
-                int firstBlock = fileFirstBlock[i];
-                foreach (IndirectPlan plan in filePlans[i])
-                {
-                    SerializeIndirectNode(plan.Root, firstBlock,
-                        dataBlock => imageDigests.AsSpan(dataBlock * 32, 32).ToArray(),
-                        (blockIndex, bytes) => bytes.CopyTo(indirectRegion.AsSpan((blockIndex - indirectRegionStart) * BlockSize)),
-                        recordDigest: (blockIndex, hash) => hash.CopyTo(imageDigests, blockIndex * 32));
-                }
-            }
-        }
-
-        // Inode table (data + indirect signatures).
-        byte[] inodeTable = new byte[BlockSize];
-        BuildInodeTableFromHashes(inodeTable, parameters, files, fileLengths, imageDigests,
-            fileFirstBlock, fileBlockCount, filePlans,
-            superRootDirentIndex, fltIndex, urootDirentIndex);
-        Sha3.Sha3_256(inodeTable).CopyTo(imageDigests, inodeTableIndex * 32);
-
-        // Superblock (plaintext).
-        byte[] superblock = new byte[BlockSize];
-        BuildSuperblock(superblock, parameters, files.Count, totalBlocks, inodeTableIndex,
-            imageDigests.AsSpan(inodeTableIndex * 32, 32).ToArray());
-        Sha3.Sha3_256(superblock).CopyTo(imageDigests, superblockIndex * 32);
-        byte[] icv = ComputeSuperblockIcv(superblock);
-
-        // ---- 4. Classify blocks for AES-XTS. ----
-        var kinds = new OuterBlockKind[totalBlocks];
-        for (int i = 0; i < files.Count; i++)
-        {
-            OuterBlockKind kind = files[i].Signed ? OuterBlockKind.Signed : OuterBlockKind.Data;
-            for (int j = 0; j < fileBlockCount[i]; j++)
-                kinds[fileFirstBlock[i] + j] = kind;
-        }
-        kinds[superblockIndex] = OuterBlockKind.Plaintext;
-        kinds[inodeTableIndex] = OuterBlockKind.Signed;
-        kinds[superRootDirentIndex] = OuterBlockKind.Signed;
-        kinds[fltIndex] = OuterBlockKind.Signed;
-        for (int b = 0; b < indirectBlocksTotal; b++)
-            kinds[indirectRegionStart + b] = OuterBlockKind.Signed;
-        kinds[urootDirentIndex] = OuterBlockKind.Signed;
-
-        // ---- 5. Write the image, encrypting data + metadata blocks. ----
+        // ---- 2. Write the image: hash + encrypt the data blocks in a single fused pass. ----
         using (var outFs = new FileStream(full, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan))
         using (var xts = encryptOutput ? new AesXts(dataKey, tweakKey) : null)
         {
             outFs.SetLength(imageLength);
             WriteDataBlocks(outFs, files, fileFirstBlock, fileBlockCount, dataBlockTotal,
-                encryptOutput, tweakKey, dataKey, parallelism, progress);
+                encryptOutput, tweakKey, dataKey, parallelism, imageDigests, progress);
 
+            // ---- 3. Structural metadata blocks (need the data digests captured above). ----
+            byte[] superRootBlock = new byte[BlockSize];
+            BuildSuperRootDirents(superRootBlock);
+            Sha3.Sha3_256(superRootBlock).CopyTo(imageDigests, superRootDirentIndex * 32);
+
+            byte[] fltBlock = new byte[BlockSize];
+            BuildFlatPathTableFromNames(fltBlock, files.Select(f => f.Name).ToArray());
+            Sha3.Sha3_256(fltBlock).CopyTo(imageDigests, fltIndex * 32);
+
+            byte[] urootBlock = new byte[BlockSize];
+            BuildUrootDirentsFromNames(urootBlock, files.Select(f => f.Name).ToArray());
+            Sha3.Sha3_256(urootBlock).CopyTo(imageDigests, urootDirentIndex * 32);
+
+            // Indirect tree blocks are serialized leaf-first; each block's plaintext SHA3 is recorded
+            // in the digest table (the data-block SHA3s were captured above).
+            indirectRegion = indirectBlocksTotal > 0
+                ? new byte[checked(indirectBlocksTotal * BlockSize)] : null;
+            if (indirectRegion is not null)
+            {
+                for (int i = 0; i < files.Count; i++)
+                {
+                    int firstBlock = fileFirstBlock[i];
+                    foreach (IndirectPlan plan in filePlans[i])
+                    {
+                        SerializeIndirectNode(plan.Root, firstBlock,
+                            dataBlock => imageDigests.AsSpan(dataBlock * 32, 32).ToArray(),
+                            (blockIndex, bytes) => bytes.CopyTo(indirectRegion.AsSpan((blockIndex - indirectRegionStart) * BlockSize)),
+                            recordDigest: (blockIndex, hash) => hash.CopyTo(imageDigests, blockIndex * 32));
+                    }
+                }
+            }
+
+            // Inode table (data + indirect signatures).
+            byte[] inodeTable = new byte[BlockSize];
+            BuildInodeTableFromHashes(inodeTable, parameters, files, fileLengths, imageDigests,
+                fileFirstBlock, fileBlockCount, filePlans,
+                superRootDirentIndex, fltIndex, urootDirentIndex);
+            Sha3.Sha3_256(inodeTable).CopyTo(imageDigests, inodeTableIndex * 32);
+
+            // Superblock (plaintext).
+            superblock = new byte[BlockSize];
+            BuildSuperblock(superblock, parameters, files.Count, totalBlocks, inodeTableIndex,
+                imageDigests.AsSpan(inodeTableIndex * 32, 32).ToArray());
+            Sha3.Sha3_256(superblock).CopyTo(imageDigests, superblockIndex * 32);
+            icv = ComputeSuperblockIcv(superblock);
+
+            // ---- 4. Classify blocks for AES-XTS. ----
+            kinds = new OuterBlockKind[totalBlocks];
+            for (int i = 0; i < files.Count; i++)
+            {
+                OuterBlockKind kind = files[i].Signed ? OuterBlockKind.Signed : OuterBlockKind.Data;
+                for (int j = 0; j < fileBlockCount[i]; j++)
+                    kinds[fileFirstBlock[i] + j] = kind;
+            }
+            kinds[superblockIndex] = OuterBlockKind.Plaintext;
+            kinds[inodeTableIndex] = OuterBlockKind.Signed;
+            kinds[superRootDirentIndex] = OuterBlockKind.Signed;
+            kinds[fltIndex] = OuterBlockKind.Signed;
+            for (int b = 0; b < indirectBlocksTotal; b++)
+                kinds[indirectRegionStart + b] = OuterBlockKind.Signed;
+            kinds[urootDirentIndex] = OuterBlockKind.Signed;
+
+            // ---- 5. Write the metadata blocks. ----
             WriteBlock(outFs, superblockIndex, superblock, OuterBlockKind.Plaintext, encryptOutput, xts);
             WriteBlock(outFs, inodeTableIndex, inodeTable, OuterBlockKind.Signed, encryptOutput, xts);
             WriteBlock(outFs, superRootDirentIndex, superRootBlock, OuterBlockKind.Signed, encryptOutput, xts);
@@ -567,67 +575,18 @@ public static class ProsperoOuterPfsBuilder
         };
     }
 
-    /// <summary>Encrypts one block for its kind and returns the ciphertext (Data/Signed only).</summary>
     /// <summary>
-    /// Records SHA3-256 of every plaintext data block into <paramref name="imageDigests"/>. Reads each
-    /// source sequentially and hashes a small window of blocks concurrently; the digest table is
-    /// independent of the thread count.
-    /// </summary>
-    private static void HashDataBlocks(
-        IReadOnlyList<OuterPfsFileSource> files, int[] fileFirstBlock, int[] fileBlockCount,
-        byte[] imageDigests, int parallelism)
-    {
-        byte[] block = new byte[BlockSize];
-        if (parallelism <= 1)
-        {
-            for (int i = 0; i < files.Count; i++)
-            {
-                using var src = new FileStream(files[i].Path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
-                for (int j = 0; j < fileBlockCount[i]; j++)
-                {
-                    int read = ReadBlock(src, block);
-                    if (read < BlockSize)
-                        block.AsSpan(read).Clear();
-                    Sha3.Sha3_256(block).CopyTo(imageDigests, (fileFirstBlock[i] + j) * 32);
-                }
-            }
-            return;
-        }
-
-        int window = Math.Max(parallelism, 8);
-        byte[][] buffers = new byte[window][];
-        for (int k = 0; k < window; k++)
-            buffers[k] = new byte[BlockSize];
-        var options = new ParallelOptions { MaxDegreeOfParallelism = parallelism };
-        for (int i = 0; i < files.Count; i++)
-        {
-            using var src = new FileStream(files[i].Path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
-            for (int start = 0; start < fileBlockCount[i]; start += window)
-            {
-                int count = Math.Min(window, fileBlockCount[i] - start);
-                for (int k = 0; k < count; k++)
-                {
-                    int read = ReadBlock(src, buffers[k]);
-                    if (read < BlockSize)
-                        buffers[k].AsSpan(read).Clear();
-                }
-                int baseIndex = fileFirstBlock[i] + start;
-                Parallel.For(0, count, options, k =>
-                    Sha3.Sha3_256(buffers[k]).CopyTo(imageDigests, (baseIndex + k) * 32));
-            }
-        }
-    }
-
-    /// <summary>
-    /// Writes the file-data blocks at their planned offsets, encrypting signed/data blocks with
-    /// AES-XTS. Reading and writing are sequential; the AES-XTS work runs concurrently over a bounded
-    /// window, so peak memory stays at a few blocks and the bytes are identical to a serial write.
+    /// Writes the file-data blocks at their planned offsets in a single pass: each block's plaintext
+    /// SHA3-256 is recorded into <paramref name="imageDigests"/> and (when encrypting) the block is
+    /// AES-XTS encrypted before it is written. Reading and writing are sequential; the SHA3/AES-XTS
+    /// work runs concurrently over a bounded window, so peak memory stays at a few blocks and the
+    /// bytes are identical to a serial write.
     /// </summary>
     private static void WriteDataBlocks(
         FileStream outFs, IReadOnlyList<OuterPfsFileSource> files,
         int[] fileFirstBlock, int[] fileBlockCount, int dataBlockTotal,
         bool encryptOutput, ReadOnlySpan<byte> tweakKey, ReadOnlySpan<byte> dataKey,
-        int parallelism, IProgress<ProsperoBuildProgress>? progress)
+        int parallelism, byte[] imageDigests, IProgress<ProsperoBuildProgress>? progress)
     {
         int processedBlocks = 0;
         if (parallelism <= 1 || !encryptOutput)
@@ -645,6 +604,7 @@ public static class ProsperoOuterPfsBuilder
                     int read = ReadBlock(src, block);
                     if (read < BlockSize)
                         block.AsSpan(read).Clear();
+                    Sha3.Sha3_256(block).CopyTo(imageDigests, blockIndex * 32);
                     if (encryptOutput)
                         block = ApplyXts(xts!, block, kind, blockIndex);
                     outFs.Write(block, 0, BlockSize);
@@ -679,6 +639,7 @@ public static class ProsperoOuterPfsBuilder
                     () => new AesXts(data, tweak),
                     (k, _, local) =>
                     {
+                        Sha3.Sha3_256(buffers[k]).CopyTo(imageDigests, (baseIndex + k) * 32);
                         buffers[k] = ApplyXts(local, buffers[k], kind, baseIndex + k);
                         return local;
                     },
@@ -692,6 +653,7 @@ public static class ProsperoOuterPfsBuilder
         }
     }
 
+    /// <summary>Encrypts one block for its kind and returns the ciphertext (Data/Signed only).</summary>
     private static byte[] ApplyXts(AesXts xts, byte[] plaintext, OuterBlockKind kind, int blockIndex)
     {
         ulong sector = kind == OuterBlockKind.Signed
