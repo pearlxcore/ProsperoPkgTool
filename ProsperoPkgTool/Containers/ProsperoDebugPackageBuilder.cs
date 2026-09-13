@@ -69,6 +69,18 @@ public sealed class DebugPackageBuildOptions
     /// <summary>Workspace for the file-backed (multi-GiB) path; null uses the system temp folder.</summary>
     public string? TempDirectory { get; init; }
 
+    /// <summary>
+    /// Reclaim orphaned build workspaces (left by a killed run) in the temp root before starting.
+    /// Live workspaces are never touched. Defaults to true.
+    /// </summary>
+    public bool SweepStaleTempWorkspaces { get; init; } = true;
+
+    /// <summary>Age in hours after which an orphaned (owner no longer running) workspace is reclaimed.</summary>
+    public int StaleWorkspaceHours { get; init; } = 12;
+
+    /// <summary>Skip the free-space preflight (power users/tests); defaults to false.</summary>
+    public bool SkipFreeSpaceCheck { get; init; }
+
     /// <summary>Explicit PlayGo project; when null a source <c>playgo-chunk.dat</c> is parsed, else a default is generated.</summary>
     public PlayGoProject? PlayGo { get; init; }
 
@@ -132,6 +144,29 @@ public static class ProsperoDebugPackageBuilder
         var console = options.Log ?? new DebugPackageBuildLog();
         long tsSec = options.TimestampSeconds;
         uint tsNsec = options.TimestampNanoseconds;
+
+        // Reclaim workspaces orphaned by a killed/crashed run before starting a new one, so a failed
+        // multi-GiB build cannot silently leak tens of gigabytes in the temp folder.
+        if (options.SweepStaleTempWorkspaces)
+        {
+            string sweepRoot = options.TempDirectory ?? Path.GetTempPath();
+            TempWorkspace.SweepOrphans(sweepRoot, TimeSpan.FromHours(Math.Max(1, options.StaleWorkspaceHours)), console.Log);
+        }
+
+        // Fail fast when the temp/output volumes cannot hold the build's peak, instead of losing
+        // hours and dying mid-write on a multi-GiB package.
+        if (!options.SkipFreeSpaceCheck)
+        {
+            long rawPayload = 0;
+            foreach (ProsperoInnerImageAssembler.InnerFile file in files)
+                rawPayload += file.PayloadLength;
+            DiskSpaceReport space = DiskSpaceGuard.Check(DiskSpaceGuard.Estimate(rawPayload, options.OutputPath, options.TempDirectory));
+            if (space.Status == DiskSpaceStatus.Insufficient)
+                throw new ProsperoInsufficientSpaceException(
+                    DiskSpaceGuard.Describe(space), space.RequiredBytes, space.AvailableBytes, space.Root);
+            if (space.Status == DiskSpaceStatus.NearLimit)
+                console.Log($"  warning: {DiskSpaceGuard.Describe(space)}");
+        }
 
         ProsperoParam param = ProsperoParamReader.Read(options.ParamJson);
 
@@ -494,9 +529,7 @@ public static class ProsperoDebugPackageBuilder
         int krakenThreads = buildOptions.KrakenThreads;
         uint contentVersionHi = ContentVersionHigh(param.ContentVersion);
 
-        string tempRoot = Path.Combine(
-            buildOptions.TempDirectory ?? Path.GetTempPath(), "libprospero-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(tempRoot);
+        string tempRoot = TempWorkspace.Create(buildOptions.TempDirectory ?? Path.GetTempPath());
         try
         {
             string innerImagePath = Path.Combine(tempRoot, "pfs_image.dat");
@@ -750,13 +783,7 @@ public static class ProsperoDebugPackageBuilder
         }
         finally
         {
-            try
-            {
-                if (Directory.Exists(tempRoot))
-                    Directory.Delete(tempRoot, recursive: true);
-            }
-            catch (IOException) { }
-            catch (UnauthorizedAccessException) { }
+            TempWorkspace.Delete(tempRoot);
         }
     }
 

@@ -229,6 +229,10 @@ public sealed class MainForm : Form
             _output.FinishRun(outputPage, exitCode, stopwatch.Elapsed);
             _operationStatus.Text = exitCode == 0 ? "Completed" : $"Failed ({exitCode})";
             _lastRunStatus.Text = $"{command.Name}: {DateTime.Now:HH:mm:ss}";
+            if (exitCode == 5)
+                Warn("The build could not start: not enough free disk space. See the output tab for the " +
+                     "required vs available space, then free space or point the temp/output to another volume.",
+                     "Not enough free space");
             if (exitCode == 0 && command.UsesSelectedPackage)
                 _packageBar.AddRecent(_packageBar.PackagePath);
         }

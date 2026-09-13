@@ -62,6 +62,11 @@ public static class CliApplication
             Console.Error.WriteLine("Operation cancelled.");
             return Task.FromResult(130);
         }
+        catch (ProsperoInsufficientSpaceException space)
+        {
+            Console.Error.WriteLine($"Error: {space.Message}");
+            return Task.FromResult(5);
+        }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or InvalidDataException)
         {
             Console.Error.WriteLine($"Error: {exception.Message}");
@@ -563,6 +568,9 @@ public static class CliApplication
         int krakenLevel = KrakenTuning.DefaultLevel;
         int krakenThreads = 0;
         ulong? sdkVersionOverride = null;
+        bool sweepTemp = true;
+        int staleHours = 12;
+        string? tempDir = null;
         for (int i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -602,6 +610,15 @@ public static class CliApplication
                 case "--sdk" when i + 1 < args.Length:
                     sdkVersionOverride = ParseSdkOption(args[++i]);
                     break;
+                case "--no-temp-sweep":
+                    sweepTemp = false;
+                    break;
+                case "--stale-hours" when i + 1 < args.Length:
+                    staleHours = ParseIntOption("--stale-hours", args[++i]);
+                    break;
+                case "--temp" when i + 1 < args.Length:
+                    tempDir = args[++i];
+                    break;
                 case "--keep-staging":
                     keepStaging = true;
                     break;
@@ -620,7 +637,7 @@ public static class CliApplication
         }
         if (backup is null || output is null)
         {
-            Console.Error.WriteLine("Usage: ProsperoPkgTool convert <backup-folder> --out <package.pkg> [--decrypted <subfolder>] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--compression stored|kraken] [--kraken-level -4..9] [--kraken-threads <n|0=auto>] [--sdk <major|0x-id>] [--staging <folder>] [--keep-staging] [--use-embedded-right-sprx] [--verbose]");
+            Console.Error.WriteLine("Usage: ProsperoPkgTool convert <backup-folder> --out <package.pkg> [--decrypted <subfolder>] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--compression stored|kraken] [--kraken-level -4..9] [--kraken-threads <n|0=auto>] [--sdk <major|0x-id>] [--no-temp-sweep] [--stale-hours <n>] [--temp <dir>] [--staging <folder>] [--keep-staging] [--use-embedded-right-sprx] [--verbose]");
             return 2;
         }
 
@@ -661,6 +678,17 @@ public static class CliApplication
                 buildArgs.Add("--sdk");
                 buildArgs.Add("0x" + sdkValue.ToString("X16", System.Globalization.CultureInfo.InvariantCulture));
             }
+            if (!sweepTemp) buildArgs.Add("--no-temp-sweep");
+            if (staleHours != 12)
+            {
+                buildArgs.Add("--stale-hours");
+                buildArgs.Add(staleHours.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+            if (!string.IsNullOrWhiteSpace(tempDir))
+            {
+                buildArgs.Add("--temp");
+                buildArgs.Add(tempDir!);
+            }
             if (verbose) buildArgs.Add("--verbose");
 
             int code = RunInnerImageCreate(buildArgs.ToArray());
@@ -691,6 +719,7 @@ public static class CliApplication
         string? contentId = null;
         string? gp5Path = null;
         string? requestedType = null;
+        string? tempDir = null;
         ProsperoInnerCompressionMode compressionMode = ProsperoInnerCompressionMode.Auto;
         string passcode = Gp5Constants.DefaultPasscode;
         bool passcodeProvided = false;
@@ -702,6 +731,8 @@ public static class CliApplication
         int krakenThreads = 0;
         byte[]? outerSeed = null;
         ulong? sdkVersionOverride = null;
+        bool sweepTemp = true;
+        int staleHours = 12;
         for (int i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -745,6 +776,15 @@ public static class CliApplication
                 case "--sdk" when i + 1 < args.Length:
                     sdkVersionOverride = ParseSdkOption(args[++i]);
                     break;
+                case "--no-temp-sweep":
+                    sweepTemp = false;
+                    break;
+                case "--stale-hours" when i + 1 < args.Length:
+                    staleHours = ParseIntOption("--stale-hours", args[++i]);
+                    break;
+                case "--temp" when i + 1 < args.Length:
+                    tempDir = args[++i];
+                    break;
                 case "--no_passcode":
                     noPasscode = true;
                     break;
@@ -763,7 +803,7 @@ public static class CliApplication
         }
         if (source is null || output is null)
         {
-            Console.Error.WriteLine("Usage: ProsperoPkgTool img_create <source-folder | project.gp5> --out <package.pkg> [--type base] [--compression stored|kraken] [--kraken-level -4..9] [--kraken-threads <n|0=auto>] [--seed <32-hex>] [--sdk <major|0x-id>] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--no_fself] [--no_right_sprx] [--verbose]");
+            Console.Error.WriteLine("Usage: ProsperoPkgTool img_create <source-folder | project.gp5> --out <package.pkg> [--type base] [--compression stored|kraken] [--kraken-level -4..9] [--kraken-threads <n|0=auto>] [--seed <32-hex>] [--sdk <major|0x-id>] [--no-temp-sweep] [--stale-hours <n>] [--temp <dir>] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--no_fself] [--no_right_sprx] [--verbose]");
             return 2;
         }
 
@@ -899,6 +939,9 @@ public static class CliApplication
             OuterSeed = outerSeed,
             DeterministicEntryKeys = outerSeed is not null,
             SdkVersionOverride = sdkVersionOverride,
+            SweepStaleTempWorkspaces = sweepTemp,
+            StaleWorkspaceHours = staleHours,
+            TempDirectory = tempDir,
             PlayGo = gp5PlayGo,
             SceSysFiles = sceSysFiles,
             FakeSignModules = fakeSignModules,
