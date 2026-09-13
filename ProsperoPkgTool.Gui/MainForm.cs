@@ -287,23 +287,27 @@ public sealed class MainForm : Form
 
     private static string ResolveCliExecutable()
     {
-        string besideGui = Path.Combine(AppContext.BaseDirectory, "ProsperoPkgTool.exe");
-        if (File.Exists(besideGui))
-            return besideGui;
-
+        // Prefer the newest CLI build: a stale copy is copied beside the GUI when the GUI is built,
+        // but the engine is often rebuilt on its own, so pick whichever candidate is most recent.
+        var candidates = new List<string> { Path.Combine(AppContext.BaseDirectory, "ProsperoPkgTool.exe") };
         DirectoryInfo? directory = new(AppContext.BaseDirectory);
         while (directory is not null)
         {
             foreach (string configuration in new[] { "Release", "Debug" })
             {
-                string candidate = Path.Combine(directory.FullName, "ProsperoPkgTool", "bin", configuration,
-                    "net10.0", "ProsperoPkgTool.exe");
-                if (File.Exists(candidate))
-                    return candidate;
+                candidates.Add(Path.Combine(directory.FullName, "ProsperoPkgTool", "bin", configuration,
+                    "net10.0", "ProsperoPkgTool.exe"));
             }
             directory = directory.Parent;
         }
-        throw new FileNotFoundException("ProsperoPkgTool.exe was not found. Build the complete solution so the GUI can run CLI operations.");
+
+        string? newest = candidates
+            .Where(File.Exists)
+            .OrderByDescending(File.GetLastWriteTimeUtc)
+            .FirstOrDefault();
+        if (newest is null)
+            throw new FileNotFoundException("ProsperoPkgTool.exe was not found. Build the complete solution so the GUI can run CLI operations.");
+        return newest;
     }
 
     private static string FormatArguments(IEnumerable<string> arguments) => string.Join(" ", arguments.Select(argument =>
