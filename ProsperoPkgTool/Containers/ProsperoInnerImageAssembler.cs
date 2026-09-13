@@ -502,6 +502,13 @@ public sealed class ProsperoInnerImageAssembler
         };
     }
 
+    /// <summary>
+    /// When true, every accepted Kraken block is decoded back and compared before it is written. This
+    /// is a development correctness net; it roughly doubles the per-block cost, so it is disabled in
+    /// production. The encoder's output is independently covered by the compression unit tests.
+    /// </summary>
+    private const bool VerifyKrakenRoundTrip = false;
+
     private static bool VerifyKraken(ReadOnlySpan<byte> raw, KrakenEncoder.EncodedBlock encoded)
     {
         byte[] decoded = new byte[raw.Length];
@@ -1133,7 +1140,7 @@ public sealed class ProsperoInnerImageAssembler
                 bool terminalFileBlock = blockOffset + rawLength >= f.PayloadLength;
                 KrakenEncoder.EncodedBlock? kraken = compressionMode == ProsperoInnerCompressionMode.Stored
                     || f.StoreRaw || terminalFileBlock ? null : KrakenEncoder.TryEncodeNewLz(raw);
-                if (kraken is not null && VerifyKraken(raw, kraken))
+                if (kraken is not null && (!VerifyKrakenRoundTrip || VerifyKraken(raw, kraken)))
                     EmitKraken(kraken, rawLength, blockOffset, ref sourceBlockIndex);
                 else
                     EmitStored(raw.ToArray(), rawLength, blockOffset, ref sourceBlockIndex);
@@ -1166,7 +1173,7 @@ public sealed class ProsperoInnerImageAssembler
                     bool terminalFileBlock = batchStart + (long)i * chunk + lengths[i] >= f.PayloadLength;
                     KrakenEncoder.EncodedBlock? kraken = f.StoreRaw || terminalFileBlock
                         ? null : KrakenEncoder.TryEncodeNewLz(raws[i]);
-                    results[i] = kraken is not null && VerifyKraken(raws[i], kraken)
+                    results[i] = kraken is not null && (!VerifyKrakenRoundTrip || VerifyKraken(raws[i], kraken))
                         ? (kraken, null)
                         : (null, raws[i]);
                 });

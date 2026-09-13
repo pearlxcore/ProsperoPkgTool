@@ -39,6 +39,12 @@ internal static class KrakenLzEncoder
     private const int HashSize = 1 << HashBits;
     private const int MaxChain = 48;
 
+    // Per-thread scratch reused across blocks. A 64K-entry head table and an n-entry chain array were
+    // allocated for every 128/256 KiB block, which dominated large builds' allocation/GC. The finder
+    // fully re-initialises head each call and never reads stale prev entries, so reuse is byte-identical.
+    [System.ThreadStatic] private static int[]? t_head;
+    [System.ThreadStatic] private static int[]? t_prev;
+
     internal static KrakenEncoder.EncodedBlock? Encode(ReadOnlySpan<byte> input)
     {
         // A seeded chunk must carry SeedSize literal bytes before any match; shorter inputs fall
@@ -48,9 +54,14 @@ internal static class KrakenLzEncoder
 
         byte[] data = input.ToArray();
         int n = data.Length;
-        var head = new int[HashSize];
+        int[] head = t_head ??= new int[HashSize];
         Array.Fill(head, -1);
-        var prev = new int[n];
+        int[] prev = t_prev;
+        if (prev is null || prev.Length < n)
+        {
+            prev = new int[n];
+            t_prev = prev;
+        }
         int nextInsert = 0;
 
         int firstEnd = Math.Min(n, ChunkSize);
@@ -242,9 +253,14 @@ internal static class KrakenLzEncoder
         while (candidate >= 0 && chain < MaxChain)
         {
             int distance = pos - candidate;
-            if (distance >= SeedSize)
+            // A usable match needs at least MinMatch (4) bytes, and the 3-byte hash collides freely.
+            // Gate on a 4-byte prefix before measuring the run: this is a pure speed-up and yields the
+            // same result, because a length below MinMatch is reported as "no match" either way.
+            if (distance >= SeedSize
+                && data[candidate] == data[pos] && data[candidate + 1] == data[pos + 1]
+                && data[candidate + 2] == data[pos + 2] && data[candidate + 3] == data[pos + 3])
             {
-                int length = 0;
+                int length = MinMatch;
                 while (length < maxLength && data[candidate + length] == data[pos + length])
                     length++;
                 if (length > bestLength)
