@@ -27,6 +27,23 @@ dotnet build .\ProsperoPkgTool.slnx -c Release
 
 The CLI lands in `ProsperoPkgTool\bin\Release\net10.0\ProsperoPkgTool.exe`.
 
+## Testing
+
+```powershell
+dotnet test .\ProsperoPkgTool.Tests\ProsperoPkgTool.Tests.csproj -c Release
+```
+
+The suite covers read/write/verify round-trips, Sony-fixture parity, and reference cross-reads. Three
+tests are **opt-in** and skipped in a normal run because they need a locally supplied retail package
+(they are not repository fixtures):
+
+- `ProsperoNapsLayoutTests.RetailPackage_NapsLayout_RoundTripsByteExact`
+- `ProsperoNapsLayoutTests.RetailPackage_CblockInfo_AllEntriesRoundTripByteExact`
+- `TempSliceExtractTests.Extract_TargetDataBlocks`
+
+To run them, place a retail package at the path referenced in the test (for example
+`C:\Users\User\Desktop\New folder\ps5 pkg\PPSA03530-bd-nw.pkg`) and remove its `Skip =` argument.
+
 ## Commands
 
 Run the exe with no arguments for the full list. The main ones:
@@ -67,7 +84,9 @@ pick an operation, press F5.
 ## Notes
 
 Debug packages are keyed to the console passcode, and retail consoles reject them because
-there is no Sony signing. Patch, delta, and DLC building are not implemented.
+there is no Sony signing. Update/patch (LIH), delta, and DLC building are not implemented, and
+retail finalization is intentionally out of scope (it needs Sony key material). The next
+implementation priorities are **update/patch (LIH) writing**, then **DLC**.
 
 ## Credits
 
