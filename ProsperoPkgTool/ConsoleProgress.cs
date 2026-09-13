@@ -12,6 +12,7 @@ internal sealed class ConsoleProgress : IProgress<ProsperoBuildProgress>
     private readonly bool _redirected;
     private string? _lastStage;
     private int _lastPercent = -1;
+    private int _lastMilestone = -1;
     private bool _wroteLine;
 
     public ConsoleProgress(bool enabled)
@@ -31,8 +32,19 @@ internal sealed class ConsoleProgress : IProgress<ProsperoBuildProgress>
     {
         if (!_enabled || value.Total <= 0)
             return;
+        // Coarse stage boundaries (NAPS/CNT/Finalize report 1/1) are covered by the stage summary.
+        if (value.Total == 1)
+            return;
         int percent = (int)(100.0 * value.Done / value.Total);
-        Write($"  [{percent,3}%] {value.Stage} ({value.Done:N0}/{value.Total:N0})", value.Stage, percent);
+        // Whole-10% milestones only (always including completion); a captured stdout would otherwise
+        // get one line per file / per percent.
+        if (!string.Equals(value.Stage, _lastStage, StringComparison.Ordinal))
+            _lastMilestone = -1;
+        int milestone = percent / 10;
+        if (milestone == _lastMilestone && percent < 100)
+            return;
+        _lastMilestone = milestone;
+        Write($"    {percent,3}%  {value.Stage} ({value.Done:N0}/{value.Total:N0})", value.Stage, percent);
     }
 
     /// <summary>Reports extract progress as files completed out of a total.</summary>
@@ -74,6 +86,7 @@ internal sealed class ConsoleProgress : IProgress<ProsperoBuildProgress>
             Console.WriteLine();
         _lastStage = null;
         _lastPercent = -1;
+        _lastMilestone = -1;
         _wroteLine = false;
     }
 

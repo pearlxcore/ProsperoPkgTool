@@ -367,7 +367,7 @@ public static class ProsperoOuterPfsBuilder
             OuterBlockKind kind = build.BlockKinds[i];
             if (kind == OuterBlockKind.Plaintext)
             {
-                progress?.Report(new ProsperoBuildProgress("Encrypt", i + 1, build.BlockCount) { StageId = ProsperoBuildStage.OuterPfs });
+                progress?.Report(new ProsperoBuildProgress("Outer PFS encrypt", i + 1, build.BlockCount) { StageId = ProsperoBuildStage.OuterPfs });
                 continue;
             }
             int offset = i * BlockSize;
@@ -377,7 +377,7 @@ public static class ProsperoOuterPfsBuilder
             byte[] block = build.Plaintext.AsSpan(offset, BlockSize).ToArray();
             byte[] transformed = encrypt ? xts.Encrypt(block, sector) : xts.Decrypt(block, sector);
             transformed.CopyTo(build.Plaintext, offset);
-            progress?.Report(new ProsperoBuildProgress("Encrypt", i + 1, build.BlockCount) { StageId = ProsperoBuildStage.OuterPfs });
+            progress?.Report(new ProsperoBuildProgress("Outer PFS encrypt", i + 1, build.BlockCount) { StageId = ProsperoBuildStage.OuterPfs });
         }
     }
 

@@ -301,11 +301,20 @@ public static class ProsperoDebugPackageBuilder
     private static void ReportStage(DebugPackageBuildLog console, ProsperoBuildStage stage) =>
         console.Progress?.Report(new ProsperoBuildProgress(ProsperoBuildStages.Name(stage), 1, 1) { StageId = stage });
 
-    /// <summary>Logs the elapsed time of the stage just completed and restarts the clock.</summary>
+    /// <summary>Logs a stage header (e.g. "[stage 1/5] Inner image") and starts its timer.</summary>
+    private static void BeginStage(System.Diagnostics.Stopwatch clock, DebugPackageBuildLog console, ProsperoBuildStage stage)
+    {
+        int index = ProsperoBuildStages.IndexOf(stage);
+        console.Log("");
+        console.Log($"[stage {index + 1}/{ProsperoBuildStages.Build.Count}] {ProsperoBuildStages.Name(stage)}");
+        clock.Restart();
+    }
+
+    /// <summary>Logs the elapsed time of the stage just completed.</summary>
     private static void LogStage(System.Diagnostics.Stopwatch clock, DebugPackageBuildLog console, ProsperoBuildStage stage)
     {
-        console.Log($"  [{ProsperoBuildStages.Name(stage)}] {clock.Elapsed.TotalSeconds:F3} s");
-        clock.Restart();
+        int index = ProsperoBuildStages.IndexOf(stage);
+        console.Log($"[stage {index + 1}/{ProsperoBuildStages.Build.Count}] {ProsperoBuildStages.Name(stage)} complete in {clock.Elapsed.TotalSeconds:F1} s");
     }
 
     /// <summary>
@@ -370,25 +379,28 @@ public static class ProsperoDebugPackageBuilder
         uint contentVersionHi = ContentVersionHigh(param.ContentVersion);
         var stageClock = System.Diagnostics.Stopwatch.StartNew();
 
+        BeginStage(stageClock, console, ProsperoBuildStage.InnerImage);
         var assembler = new ProsperoInnerImageAssembler(tsSec, tsNsec);
         ProsperoInnerImageAssembler.InnerImageResult innerResult = assembler.Build(
             innerFiles, compressionMode, console.Progress, krakenLevel, krakenThreads);
         console.Finish();
-        console.Log($"  Inner image: {innerResult.Image.Length} bytes, {innerResult.Ndblock} mount blocks, {innerResult.InodeCount} inodes");
+        console.Log($"    image {innerResult.Image.Length:N0} bytes, {innerResult.Ndblock:N0} mount blocks, {innerResult.InodeCount:N0} inodes");
         ProsperoCompressionMetrics compression = innerResult.CompressionMetrics;
-        console.Log($"  Inner payload: {compression.RawBytes} raw -> {compression.EncodedBytes} encoded; " +
+        console.Log($"    payload {compression.RawBytes:N0} -> {compression.EncodedBytes:N0} bytes; " +
             $"Kraken {compression.KrakenBlocks}, stored {compression.StoredBlocks}, ratio {compression.Ratio:P2}");
         LogStage(stageClock, console, ProsperoBuildStage.InnerImage);
 
         // ---- 3. Generate NAPS from the assembled source geometry. ----
+        BeginStage(stageClock, console, ProsperoBuildStage.Naps);
         ProsperoNapsPlanGenerator.PlanResult napsPlan = ProsperoNapsPlanGenerator.Generate(innerResult);
         byte[] naps = ProsperoNapsLayoutBuilder.Build(napsPlan.ToRequest(
             compressionMode == ProsperoInnerCompressionMode.Stored ? (byte)0 : (byte)2));
-        console.Log($"  NAPS layout: {naps.Length} bytes");
+        console.Log($"    layout {naps.Length:N0} bytes");
         ReportStage(console, ProsperoBuildStage.Naps);
         LogStage(stageClock, console, ProsperoBuildStage.Naps);
 
         // ---- 4. Build the outer PFS. ----
+        BeginStage(stageClock, console, ProsperoBuildStage.OuterPfs);
         byte[] ekpfs = ProsperoKeys.ComputeEkpfs(contentId, passcode);
         byte[] outerSeed = buildOptions.OuterSeed ?? System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
         long innerImageSize = innerResult.Image.Length;
@@ -419,10 +431,11 @@ public static class ProsperoDebugPackageBuilder
         console.Finish();
         byte[] outerImage = outerBuild.Plaintext;
         byte[] pfsImageDigest = Sha3.Sha3_256(outerBuild.Plaintext.AsSpan(outerBuild.SuperblockIndex * ProsperoOuterPfsBuilder.BlockSize, ProsperoOuterPfsBuilder.BlockSize));
-        console.Log($"  Outer PFS: {outerImage.Length} bytes, {outerBuild.BlockCount} blocks, superblock at block {outerBuild.SuperblockIndex}");
+        console.Log($"    {outerImage.Length:N0} bytes, {outerBuild.BlockCount:N0} blocks, superblock at block {outerBuild.SuperblockIndex:N0}");
         LogStage(stageClock, console, ProsperoBuildStage.OuterPfs);
 
         // ---- 5. Build the CNT container. ----
+        BeginStage(stageClock, console, ProsperoBuildStage.Cnt);
         var cntParams = new CntBuildParameters { ContentId = contentId, Passcode = passcode, ContentType = 0x20, ContentFlags = 0x02020000 };
         List<ProsperoCntBuilder.Entry> entries = ProsperoCntBuilder.BuildStandardEntries(contentId, passcode, ekpfs, buildOptions.DeterministicEntryKeys);
 
@@ -513,11 +526,12 @@ public static class ProsperoDebugPackageBuilder
         byte[] cnt = ProsperoCntBuilder.Build(entries, cntParams, outerImage, outerSeed, pfsImageDigest,
             nestedImageDigest: nestedDigest, nestedImageSize: naps.Length,
             pfsSignedDigest: pfsSignedDigest);
-        console.Log($"  CNT container: {cnt.Length} bytes");
+        console.Log($"    {cnt.Length:N0} bytes");
         ReportStage(console, ProsperoBuildStage.Cnt);
         LogStage(stageClock, console, ProsperoBuildStage.Cnt);
 
         // ---- 6. Build the FIH image with the SI (install-metadata) segment. ----
+        BeginStage(stageClock, console, ProsperoBuildStage.Finalize);
         // Three-phase build: the SI segment carries the fixed-info-digest = SHA3-256 of the FIH
         // header block, so the FIH is first built WITHOUT the SI; the SI is then assembled from
         // the (header-only) mount image and the already-produced CNT/outer geometry; finally the
@@ -556,7 +570,7 @@ public static class ProsperoDebugPackageBuilder
         string outDir = Path.GetDirectoryName(Path.GetFullPath(output))!;
         Directory.CreateDirectory(outDir);
         File.WriteAllBytes(output, fih);
-        console.Log($"Wrote: {output} ({fih.Length} bytes)");
+        console.Log($"    wrote {output} ({fih.Length:N0} bytes)");
         ReportStage(console, ProsperoBuildStage.Finalize);
         LogStage(stageClock, console, ProsperoBuildStage.Finalize);
         return new DebugPackageBuildResult(Path.GetFullPath(output), fih.Length, contentId, innerFiles.Count, false);
@@ -590,24 +604,27 @@ public static class ProsperoDebugPackageBuilder
             string innerImagePath = Path.Combine(tempRoot, "pfs_image.dat");
             string napsPath = Path.Combine(tempRoot, "naps_pkg_layout.dat");
 
+            BeginStage(stageClock, console, ProsperoBuildStage.InnerImage);
             var assembler = new ProsperoInnerImageAssembler(tsSec, tsNsec);
             ProsperoInnerImageAssembler.InnerImageResult innerResult =
                 assembler.BuildToFile(innerFiles, innerImagePath, compressionMode, console.Progress, krakenLevel, krakenThreads);
             console.Finish();
-            console.Log($"  Inner image (file-backed): {innerResult.ImageSize} bytes, {innerResult.Ndblock} mount blocks, {innerResult.InodeCount} inodes");
+            console.Log($"    image {innerResult.ImageSize:N0} bytes, {innerResult.Ndblock:N0} mount blocks, {innerResult.InodeCount:N0} inodes");
             ProsperoCompressionMetrics compression = innerResult.CompressionMetrics;
             console.Log($"  Inner payload: {compression.RawBytes} raw -> {compression.EncodedBytes} encoded; " +
                 $"Kraken {compression.KrakenBlocks}, stored {compression.StoredBlocks}, ratio {compression.Ratio:P2}");
             LogStage(stageClock, console, ProsperoBuildStage.InnerImage);
 
+            BeginStage(stageClock, console, ProsperoBuildStage.Naps);
             ProsperoNapsPlanGenerator.PlanResult napsPlan = ProsperoNapsPlanGenerator.Generate(innerResult);
             byte[] naps = ProsperoNapsLayoutBuilder.Build(napsPlan.ToRequest(
                 compressionMode == ProsperoInnerCompressionMode.Stored ? (byte)0 : (byte)2));
             File.WriteAllBytes(napsPath, naps);
-            console.Log($"  NAPS layout: {naps.Length} bytes");
-        ReportStage(console, ProsperoBuildStage.Naps);
-        LogStage(stageClock, console, ProsperoBuildStage.Naps);
+            console.Log($"    layout {naps.Length:N0} bytes");
+            ReportStage(console, ProsperoBuildStage.Naps);
+            LogStage(stageClock, console, ProsperoBuildStage.Naps);
 
+            BeginStage(stageClock, console, ProsperoBuildStage.OuterPfs);
             byte[] ekpfs = ProsperoKeys.ComputeEkpfs(contentId, passcode);
             byte[] outerSeed = buildOptions.OuterSeed ?? System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
             var outerSources = new List<OuterPfsFileSource>
@@ -635,9 +652,10 @@ public static class ProsperoDebugPackageBuilder
             console.Finish();
             byte[] pfsImageDigest = Sha3.Sha3_256(outerBuild.SuperblockPlaintext);
             long outerLength = outerBuild.ImageLength;
-            console.Log($"  Outer PFS (file-backed): {outerLength} bytes, {outerBuild.BlockCount} blocks, superblock at block {outerBuild.SuperblockIndex}");
+            console.Log($"    {outerLength:N0} bytes, {outerBuild.BlockCount:N0} blocks, superblock at block {outerBuild.SuperblockIndex:N0}");
             LogStage(stageClock, console, ProsperoBuildStage.OuterPfs);
 
+            BeginStage(stageClock, console, ProsperoBuildStage.Cnt);
             var cntParams = new CntBuildParameters { ContentId = contentId, Passcode = passcode, ContentType = 0x20, ContentFlags = 0x02020000 };
             List<ProsperoCntBuilder.Entry> entries = ProsperoCntBuilder.BuildStandardEntries(contentId, passcode, ekpfs, buildOptions.DeterministicEntryKeys);
             entries.Add(new ProsperoCntBuilder.Entry
@@ -712,7 +730,7 @@ public static class ProsperoDebugPackageBuilder
 
             byte[] cntMetadata = ProsperoCntBuilder.BuildMetadata(
                 entries, cntParams, outerLength, outerSeed, pfsImageDigest, pfsSignedDigest);
-            console.Log($"  CNT metadata (file-backed): {cntMetadata.Length} bytes");
+            console.Log($"    {cntMetadata.Length:N0} bytes");
         ReportStage(console, ProsperoBuildStage.Cnt);
         LogStage(stageClock, console, ProsperoBuildStage.Cnt);
 
@@ -831,6 +849,7 @@ public static class ProsperoDebugPackageBuilder
                     outerBuild.SuperblockPlaintext, includePfsImageXml: false);
             };
 
+            BeginStage(stageClock, console, ProsperoBuildStage.Finalize);
             ProsperoFihBuilder.FinalizePrepositionedToFile(
                 cntMetadata, output, outerLength, FihVariant.Debug, outerBuild.SuperblockIndex,
                 outerBuild.SuperblockPlaintext,
@@ -842,7 +861,7 @@ public static class ProsperoDebugPackageBuilder
         LogStage(stageClock, console, ProsperoBuildStage.Finalize);
 
             long packageLength = new FileInfo(output).Length;
-            console.Log($"Wrote: {output} ({packageLength} bytes)");
+            console.Log($"    wrote {output} ({packageLength:N0} bytes)");
             return new DebugPackageBuildResult(Path.GetFullPath(output), packageLength, contentId, innerFiles.Count, true);
         }
         finally
