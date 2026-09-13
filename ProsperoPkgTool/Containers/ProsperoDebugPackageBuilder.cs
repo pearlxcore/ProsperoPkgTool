@@ -84,6 +84,14 @@ public sealed class DebugPackageBuildOptions
     /// <summary>Explicit PlayGo project; when null a source <c>playgo-chunk.dat</c> is parsed, else a default is generated.</summary>
     public PlayGoProject? PlayGo { get; init; }
 
+    /// <summary>
+    /// Number of PlayGo chunks to generate when neither <see cref="PlayGo"/> nor a source
+    /// <c>playgo-chunk.dat</c> is supplied. 1 (the default) reproduces the verified single-chunk
+    /// source-folder model; higher counts are structural and unverified against a publisher
+    /// reference, and every inner file still defaults to chunk zero.
+    /// </summary>
+    public int PlayGoChunkCount { get; init; } = 1;
+
     /// <summary>Files under <c>sce_sys</c> (path relative to <c>sce_sys</c>) for outer CNT media entries.</summary>
     public IReadOnlyDictionary<string, byte[]>? SceSysFiles { get; init; }
 
@@ -234,7 +242,7 @@ public static class ProsperoDebugPackageBuilder
 
         IReadOnlyDictionary<string, byte[]> sceSysFiles =
             options.SceSysFiles ?? new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
-        PlayGoProject playGoProject = options.PlayGo ?? ResolvePlayGoProject(sceSysFiles, options.ContentId, console);
+        PlayGoProject playGoProject = options.PlayGo ?? ResolvePlayGoProject(sceSysFiles, options.ContentId, options.PlayGoChunkCount, console);
 
         // Large inputs use a file-backed pipeline (temp workspace) so the assembled inner/outer
         // images never materialize as a single byte[]; small inputs keep the in-memory path.
@@ -248,18 +256,18 @@ public static class ProsperoDebugPackageBuilder
 
     /// <summary>Parses a source PLGX when present, otherwise generates the observed default project.</summary>
     private static PlayGoProject ResolvePlayGoProject(
-        IReadOnlyDictionary<string, byte[]> sceSysFiles, string contentId, DebugPackageBuildLog console)
+        IReadOnlyDictionary<string, byte[]> sceSysFiles, string contentId, int chunkCount, DebugPackageBuildLog console)
     {
         if (!sceSysFiles.TryGetValue("playgo-chunk.dat", out byte[]? bytes))
-            return ProsperoPlayGoChunkBuilder.CreateDefaultProject(contentId);
+            return ProsperoPlayGoChunkBuilder.CreateProject(contentId, chunkCount);
         try
         {
             return PlayGoChunkReader.Read(bytes);
         }
         catch (Exception ex) when (ex is InvalidDataException or IOException)
         {
-            console.Log($"  warning: sce_sys/playgo-chunk.dat could not be parsed ({ex.Message}); using the default single-chunk project.");
-            return ProsperoPlayGoChunkBuilder.CreateDefaultProject(contentId);
+            console.Log($"  warning: sce_sys/playgo-chunk.dat could not be parsed ({ex.Message}); using the generated PlayGo project.");
+            return ProsperoPlayGoChunkBuilder.CreateProject(contentId, chunkCount);
         }
     }
 

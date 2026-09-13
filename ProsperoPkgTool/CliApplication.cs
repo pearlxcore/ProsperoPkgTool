@@ -733,6 +733,7 @@ public static class CliApplication
         ulong? sdkVersionOverride = null;
         bool sweepTemp = true;
         int staleHours = 12;
+        int playGoChunks = 1;
         for (int i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -785,6 +786,9 @@ public static class CliApplication
                 case "--temp" when i + 1 < args.Length:
                     tempDir = args[++i];
                     break;
+                case "--playgo-chunks" when i + 1 < args.Length:
+                    playGoChunks = ParseIntOption("--playgo-chunks", args[++i]);
+                    break;
                 case "--no_passcode":
                     noPasscode = true;
                     break;
@@ -803,7 +807,7 @@ public static class CliApplication
         }
         if (source is null || output is null)
         {
-            Console.Error.WriteLine("Usage: ProsperoPkgTool img_create <source-folder | project.gp5> --out <package.pkg> [--type base] [--compression stored|kraken] [--kraken-level -4..9] [--kraken-threads <n|0=auto>] [--seed <32-hex>] [--sdk <major|0x-id>] [--no-temp-sweep] [--stale-hours <n>] [--temp <dir>] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--no_fself] [--no_right_sprx] [--verbose]");
+            Console.Error.WriteLine("Usage: ProsperoPkgTool img_create <source-folder | project.gp5> --out <package.pkg> [--type base] [--compression stored|kraken] [--kraken-level -4..9] [--kraken-threads <n|0=auto>] [--seed <32-hex>] [--sdk <major|0x-id>] [--no-temp-sweep] [--stale-hours <n>] [--temp <dir>] [--playgo-chunks <n>] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--no_fself] [--no_right_sprx] [--verbose]");
             return 2;
         }
 
@@ -943,6 +947,7 @@ public static class CliApplication
             StaleWorkspaceHours = staleHours,
             TempDirectory = tempDir,
             PlayGo = gp5PlayGo,
+            PlayGoChunkCount = playGoChunks,
             SceSysFiles = sceSysFiles,
             FakeSignModules = fakeSignModules,
             InjectRightSprx = injectRightSprx,

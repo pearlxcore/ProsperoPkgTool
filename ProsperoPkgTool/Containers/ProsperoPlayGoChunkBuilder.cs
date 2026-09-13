@@ -44,6 +44,39 @@ public static class ProsperoPlayGoChunkBuilder
     };
 
     /// <summary>
+    /// Creates a project with <paramref name="chunkCount"/> chunks in a single scenario. The verified
+    /// clean-room default is one chunk; higher counts are structural and unverified against a
+    /// publisher reference (every inner file still defaults to chunk zero unless an explicit
+    /// assignment is supplied), so they are opt-in.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The count is outside 1..255.</exception>
+    public static PlayGoProject CreateProject(string contentId, int chunkCount)
+    {
+        if (chunkCount <= 1)
+            return CreateDefaultProject(contentId);
+        if (chunkCount > byte.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(chunkCount), chunkCount,
+                "PlayGo chunk count must be in the range 1..255.");
+
+        var chunks = new List<PlayGoChunk>(chunkCount);
+        var scenarioChunks = new List<int>(chunkCount);
+        for (int i = 0; i < chunkCount; i++)
+        {
+            chunks.Add(new PlayGoChunk(i, $"Chunk #{i}", ulong.MaxValue));
+            scenarioChunks.Add(i);
+        }
+        return new PlayGoProject
+        {
+            VersionMajor = 0x1000,
+            VersionMinor = 0,
+            ContentId = contentId,
+            DefaultScenarioId = 0,
+            Chunks = chunks,
+            Scenarios = [new PlayGoScenario(0, "Scenario #0", 1, scenarioChunks)],
+        };
+    }
+
+    /// <summary>
     /// Builds PLGX and derives D8/C8 from final inner on-disk placements. Assignment keys are
     /// normalized inner paths; absent entries, including generated keystone/right.sprx, are chunk 0.
     /// </summary>
