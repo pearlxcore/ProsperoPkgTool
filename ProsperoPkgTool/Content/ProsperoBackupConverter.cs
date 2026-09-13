@@ -319,7 +319,7 @@ public static class ProsperoBackupConverter
         for (int i = 0; i < files.Length; i++)
         {
             StageFile(files[i]);
-            progress?.Report(new ProsperoBuildProgress("Staging", i + 1, files.Length));
+            progress?.Report(new ProsperoBuildProgress("Staging", i + 1, files.Length) { StageId = ProsperoBuildStage.Staging });
         }
 
         void StageFile(string file)

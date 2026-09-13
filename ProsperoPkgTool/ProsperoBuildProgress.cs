@@ -11,6 +11,13 @@ namespace ProsperoPkgTool;
 /// <param name="Total">Total units expected for the stage, or 0 when unknown.</param>
 public readonly record struct ProsperoBuildProgress(string Stage, long Done, long Total)
 {
+    /// <summary>
+    /// Stable stage identifier; null for non-build reports (for example extraction). Consumers should
+    /// use <see cref="ProsperoBuildStages"/> to name and order the stage rather than parsing
+    /// <see cref="Stage"/>.
+    /// </summary>
+    public ProsperoBuildStage? StageId { get; init; }
+
     /// <summary>Completion ratio in [0,1]; 0 when <see cref="Total"/> is unknown.</summary>
     public double Fraction => Total > 0 ? (double)Done / Total : 0;
 }

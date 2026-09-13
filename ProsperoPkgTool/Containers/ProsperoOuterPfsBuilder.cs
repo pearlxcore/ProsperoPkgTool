@@ -304,7 +304,7 @@ public static class ProsperoOuterPfsBuilder
         {
             byte[] data = files[i].Data;
             Buffer.BlockCopy(data, 0, image, fileFirstBlock[i] * BlockSize, data.Length);
-            progress?.Report(new ProsperoBuildProgress("Outer PFS", i + 1, files.Count));
+            progress?.Report(new ProsperoBuildProgress("Outer PFS", i + 1, files.Count) { StageId = ProsperoBuildStage.OuterPfs });
         }
 
         // ---- 3. Build the structural metadata blocks. ----
@@ -367,7 +367,7 @@ public static class ProsperoOuterPfsBuilder
             OuterBlockKind kind = build.BlockKinds[i];
             if (kind == OuterBlockKind.Plaintext)
             {
-                progress?.Report(new ProsperoBuildProgress("Encrypt", i + 1, build.BlockCount));
+                progress?.Report(new ProsperoBuildProgress("Encrypt", i + 1, build.BlockCount) { StageId = ProsperoBuildStage.OuterPfs });
                 continue;
             }
             int offset = i * BlockSize;
@@ -377,7 +377,7 @@ public static class ProsperoOuterPfsBuilder
             byte[] block = build.Plaintext.AsSpan(offset, BlockSize).ToArray();
             byte[] transformed = encrypt ? xts.Encrypt(block, sector) : xts.Decrypt(block, sector);
             transformed.CopyTo(build.Plaintext, offset);
-            progress?.Report(new ProsperoBuildProgress("Encrypt", i + 1, build.BlockCount));
+            progress?.Report(new ProsperoBuildProgress("Encrypt", i + 1, build.BlockCount) { StageId = ProsperoBuildStage.OuterPfs });
         }
     }
 
@@ -610,7 +610,7 @@ public static class ProsperoOuterPfsBuilder
                     if (encryptOutput)
                         block = ApplyXts(xts!, block, kind, blockIndex);
                     outFs.Write(block, 0, BlockSize);
-                    progress?.Report(new ProsperoBuildProgress("Outer PFS", ++processedBlocks, dataBlockTotal));
+                    progress?.Report(new ProsperoBuildProgress("Outer PFS", ++processedBlocks, dataBlockTotal) { StageId = ProsperoBuildStage.OuterPfs });
                 }
             }
             return;
@@ -650,7 +650,7 @@ public static class ProsperoOuterPfsBuilder
                 for (int k = 0; k < count; k++)
                     outFs.Write(buffers[k], 0, BlockSize);
                 processedBlocks += count;
-                progress?.Report(new ProsperoBuildProgress("Outer PFS", processedBlocks, dataBlockTotal));
+                progress?.Report(new ProsperoBuildProgress("Outer PFS", processedBlocks, dataBlockTotal) { StageId = ProsperoBuildStage.OuterPfs });
             }
         }
     }

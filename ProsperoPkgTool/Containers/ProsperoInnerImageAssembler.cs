@@ -330,7 +330,7 @@ public sealed class ProsperoInnerImageAssembler
             if (f.WholeBlockRaw)
                 pos = RoundUp(pos, BlockSize);
 
-            progress?.Report(new ProsperoBuildProgress("Inner image", ++fileIndex, afidOrder.Count));
+            progress?.Report(new ProsperoBuildProgress("Inner image", ++fileIndex, afidOrder.Count) { StageId = ProsperoBuildStage.InnerImage });
         }
 
         long dataEndLogical = afidOrder.Count > 0
