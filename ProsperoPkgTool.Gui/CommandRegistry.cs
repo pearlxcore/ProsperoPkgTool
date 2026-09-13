@@ -191,6 +191,13 @@ public static class CommandRegistry
                     ["no compression", "Oodle Kraken / auto"]),
                 Slider("krakenLevel", "Kraken level (-4..9)", -4, 9, 7, "Recorded in the compressed image header (default 7)"),
                 Numeric("krakenThreads", "Kraken threads (0=auto)", 0, 256, 0, "0 = auto (processor count)"),
+                Text("sdk", "SDK override", string.Empty, "Optional: 9, 9.00.00.40 or 0x0900004000000411"),
+                Text("drmType", "DRM type override", string.Empty, "Optional: force e.g. standard to clear a locked source (default: keep source)"),
+                Numeric("playgoChunks", "PlayGo chunks", 1, 8192, 1, "Generated chunk count when no source playgo-chunk.dat (default 1)"),
+                Text("seed", "Outer seed (32 hex)", string.Empty, "Optional: deterministic seed, e.g. 000102030405060708090A0B0C0D0E0F"),
+                Folder("temp", "Temp folder", "Optional: workspace for large builds (blank = system temp)"),
+                Numeric("staleHours", "Reclaim stale temp after (hours)", 1, 720, 12, "Age before orphaned build workspaces are reclaimed"),
+                Check("noTempSweep", "Do not sweep stale temp workspaces", "Keep orphaned build workspaces (--no-temp-sweep)"),
                 Text("contentId", "Content ID", string.Empty, "Optional: overrides sce_sys/param.json"),
                 Text("passcode", "Passcode (32 chars)", CommandDef.DefaultPasscode, "Default: all-zero fake passcode"),
                 Check("noPasscode", "Use the default all-zero passcode", "Ignore the passcode field (--no_passcode)"),
@@ -222,6 +229,38 @@ public static class CommandRegistry
                 {
                     args.Add("--kraken-threads");
                     args.Add(krakenThreads);
+                }
+                if (Value(values, "sdk") is { Length: > 0 } sdk)
+                {
+                    args.Add("--sdk");
+                    args.Add(sdk);
+                }
+                if (Value(values, "drmType") is { Length: > 0 } drmType)
+                {
+                    args.Add("--drm-type");
+                    args.Add(drmType);
+                }
+                if (Value(values, "playgoChunks") is { Length: > 0 } playgoChunks)
+                {
+                    args.Add("--playgo-chunks");
+                    args.Add(playgoChunks);
+                }
+                if (Value(values, "seed") is { Length: > 0 } seed)
+                {
+                    args.Add("--seed");
+                    args.Add(seed);
+                }
+                if (Value(values, "temp") is { Length: > 0 } temp)
+                {
+                    args.Add("--temp");
+                    args.Add(temp);
+                }
+                if (values.GetValueOrDefault("noTempSweep") == "1")
+                    args.Add("--no-temp-sweep");
+                if (Value(values, "staleHours") is { Length: > 0 } staleHours)
+                {
+                    args.Add("--stale-hours");
+                    args.Add(staleHours);
                 }
                 if (Value(values, "contentId") is { Length: > 0 } contentId)
                 {
@@ -267,6 +306,11 @@ public static class CommandRegistry
                     ["no compression", "Oodle Kraken / auto"]),
                 Slider("krakenLevel", "Kraken level (-4..9)", -4, 9, 7, "Recorded in the compressed image header (default 7)"),
                 Numeric("krakenThreads", "Kraken threads (0=auto)", 0, 256, 0, "0 = auto (processor count)"),
+                Text("sdk", "SDK override", string.Empty, "Optional: 9, 9.00.00.40 or 0x0900004000000411"),
+                Text("drmType", "DRM type override", string.Empty, "Optional: force e.g. standard to clear a locked dump (default: keep source)"),
+                Folder("temp", "Temp folder", "Optional: workspace for large builds (blank = system temp)"),
+                Numeric("staleHours", "Reclaim stale temp after (hours)", 1, 720, 12, "Age before orphaned build workspaces are reclaimed"),
+                Check("noTempSweep", "Do not sweep stale temp workspaces", "Keep orphaned build workspaces (--no-temp-sweep)"),
                 Folder("staging", "Staging folder", "Optional: keep intermediate files here"),
                 Check("keepStaging", "Keep staging files", "Do not delete intermediates (--keep-staging)"),
                 Check("useEmbedded", "Use embedded right.sprx", "Use the built-in debug module (--use-embedded-right-sprx)"),
@@ -308,6 +352,28 @@ public static class CommandRegistry
                 {
                     args.Add("--kraken-threads");
                     args.Add(krakenThreads);
+                }
+                if (Value(values, "sdk") is { Length: > 0 } sdk)
+                {
+                    args.Add("--sdk");
+                    args.Add(sdk);
+                }
+                if (Value(values, "drmType") is { Length: > 0 } drmType)
+                {
+                    args.Add("--drm-type");
+                    args.Add(drmType);
+                }
+                if (Value(values, "temp") is { Length: > 0 } temp)
+                {
+                    args.Add("--temp");
+                    args.Add(temp);
+                }
+                if (values.GetValueOrDefault("noTempSweep") == "1")
+                    args.Add("--no-temp-sweep");
+                if (Value(values, "staleHours") is { Length: > 0 } staleHours)
+                {
+                    args.Add("--stale-hours");
+                    args.Add(staleHours);
                 }
                 if (Value(values, "staging") is { Length: > 0 } staging)
                 {
