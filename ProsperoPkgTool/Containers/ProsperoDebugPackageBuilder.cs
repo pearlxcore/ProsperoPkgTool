@@ -81,6 +81,13 @@ public sealed class DebugPackageBuildOptions
     /// <summary>Skip the free-space preflight (power users/tests); defaults to false.</summary>
     public bool SkipFreeSpaceCheck { get; init; }
 
+    /// <summary>
+    /// Assembled inner-image size above which the file-backed pipeline is used (peak memory bounded by
+    /// a single file). Larger titles may lower it; tests force the streaming path by setting it to 1.
+    /// Defaults to 1 GiB.
+    /// </summary>
+    public long FileBackedInnerImageThreshold { get; init; } = 1L << 30;
+
     /// <summary>Explicit PlayGo project; when null a source <c>playgo-chunk.dat</c> is parsed, else a default is generated.</summary>
     public PlayGoProject? PlayGo { get; init; }
 
@@ -138,9 +145,6 @@ public sealed record DebugPackageBuildResult(
 /// </summary>
 public static class ProsperoDebugPackageBuilder
 {
-    /// <summary>Assembled inner-image size above which the file-backed build path is used.</summary>
-    private const long FileBackedInnerImageThreshold = 1L << 30;
-
     /// <summary>Build the package described by <paramref name="options"/>.</summary>
     public static DebugPackageBuildResult Build(
         IReadOnlyList<ProsperoInnerImageAssembler.InnerFile> files, DebugPackageBuildOptions options)
@@ -264,7 +268,7 @@ public static class ProsperoDebugPackageBuilder
         long totalInnerBytes = 0;
         foreach (ProsperoInnerImageAssembler.InnerFile file in innerFiles)
             totalInnerBytes += file.PayloadLength;
-        return totalInnerBytes > FileBackedInnerImageThreshold
+        return totalInnerBytes > options.FileBackedInnerImageThreshold
             ? RunFileBacked(innerFiles, options, param, paramJson, sceSysFiles, playGoProject, tsSec, tsNsec, console)
             : RunInMemory(innerFiles, options, param, paramJson, sceSysFiles, playGoProject, tsSec, tsNsec, console);
     }
@@ -564,8 +568,6 @@ public static class ProsperoDebugPackageBuilder
         {
             string innerImagePath = Path.Combine(tempRoot, "pfs_image.dat");
             string napsPath = Path.Combine(tempRoot, "naps_pkg_layout.dat");
-            string outerPath = Path.Combine(tempRoot, "outer_pfs.dat");
-            string cntPath = Path.Combine(tempRoot, "outer.cnt");
 
             var assembler = new ProsperoInnerImageAssembler(tsSec, tsNsec);
             ProsperoInnerImageAssembler.InnerImageResult innerResult =
@@ -602,8 +604,10 @@ public static class ProsperoDebugPackageBuilder
             };
             var outerParams = new OuterPfsBuildParameters { TimestampSeconds = tsSec, TimestampNanoseconds = tsNsec, Seed = outerSeed, BlockParallelism = krakenThreads };
             (byte[] outerTweakKey, byte[] outerDataKey) = ProsperoKeys.DeriveOuterPfsXtsKeys(ekpfs, outerSeed);
+            // Write the outer PFS directly into its final FIH range (0x10000) so it is never copied.
             OuterPfsFileBuildResult outerBuild = ProsperoOuterPfsBuilder.BuildForPackageToFile(
-                outerSources, outerParams, outerPath, encryptOutput: true, outerTweakKey, outerDataKey, progress: console.Progress);
+                outerSources, outerParams, output, encryptOutput: true, outerTweakKey, outerDataKey,
+                progress: console.Progress, outputOffset: ProsperoFihBuilder.HeaderRegionSize);
             console.Finish();
             byte[] pfsImageDigest = Sha3.Sha3_256(outerBuild.SuperblockPlaintext);
             long outerLength = outerBuild.ImageLength;
@@ -681,9 +685,9 @@ public static class ProsperoDebugPackageBuilder
                 emptyFileCount: emptyFileCount);
             byte[] pfsSignedDigest = Sha3.Sha3_256(fihHeaderPreview);
 
-            ProsperoCntBuilder.BuildToFile(entries, cntParams, outerPath, outerLength, cntPath,
-                outerSeed, pfsImageDigest, pfsSignedDigest);
-            console.Log($"  CNT container (file-backed): {new FileInfo(cntPath).Length} bytes");
+            byte[] cntMetadata = ProsperoCntBuilder.BuildMetadata(
+                entries, cntParams, outerLength, outerSeed, pfsImageDigest, pfsSignedDigest);
+            console.Log($"  CNT metadata (file-backed): {cntMetadata.Length} bytes");
 
             byte[]? playGoChunkDat = entries.First(e => e.Id == CntEntryId.PlaygoChunkDat).Data;
             Func<Stream, long, byte[]> siFactory = (stream, mountLength) =>
@@ -800,8 +804,9 @@ public static class ProsperoDebugPackageBuilder
                     outerBuild.SuperblockPlaintext, includePfsImageXml: false);
             };
 
-            ProsperoFihBuilder.BuildFromCntToFile(
-                cntPath, output, FihVariant.Debug, outerBuild.SuperblockIndex,
+            ProsperoFihBuilder.FinalizePrepositionedToFile(
+                cntMetadata, output, outerLength, FihVariant.Debug, outerBuild.SuperblockIndex,
+                outerBuild.SuperblockPlaintext,
                 nestedDigest, naps.Length, nestedMetaBaseBlocks, contentVersionHi,
                 innerResult.InnerContentInodes, innerResult.AppFileCount,
                 fihMetaBlockCount, fihMetaBlockCountMirror, emptyFileCount, 0,

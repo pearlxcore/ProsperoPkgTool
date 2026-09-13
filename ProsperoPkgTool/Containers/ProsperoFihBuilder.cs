@@ -415,6 +415,65 @@ public static class ProsperoFihBuilder
     }
 
     /// <summary>
+    /// Finalizes a prepositioned (streamed) build: the outer PFS has already been written at
+    /// <see cref="HeaderRegionSize"/> in <paramref name="outputPath"/>. Writes the 0x10000-byte FIH
+    /// header into the leading region and the CNT metadata immediately after the PFS, then the SI.
+    /// No PFS bytes are copied or reread, so the outer image is written exactly once.
+    /// </summary>
+    /// <param name="cntMetadata">CNT metadata region produced by <c>ProsperoCntBuilder.BuildMetadata</c>.</param>
+    /// <param name="outputPath">Finalized output that already contains the outer PFS at 0x10000.</param>
+    /// <param name="pfsImageSize">Outer PFS image length in bytes.</param>
+    /// <param name="superblockBlock">Plaintext outer superblock block (one header region).</param>
+    /// <param name="siFactory">Optional SI-segment builder given the output stream and the mount image length.</param>
+    public static void FinalizePrepositionedToFile(
+        byte[] cntMetadata, string outputPath, long pfsImageSize, FihVariant variant,
+        int outerSuperblockIndex, byte[] superblockBlock,
+        byte[]? nestedImageDigest, long nestedImageSize, long nestedMetaBaseBlocks,
+        uint contentVersionHi, int innerContentInodes, int appFileCount,
+        int metaBlockCount, int metaBlockCountMirror, int emptyFileCount, int sparseAfidHoleCount,
+        Func<Stream, long, byte[]>? siFactory)
+    {
+        ArgumentNullException.ThrowIfNull(cntMetadata);
+        ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
+        ArgumentNullException.ThrowIfNull(superblockBlock);
+        if (superblockBlock.Length < HeaderRegionSize)
+            throw new ArgumentException("The outer superblock block is too small.", nameof(superblockBlock));
+
+        // In the finalized image the embedded CNT's pfs_image_offset must point at the shared image
+        // stored at the start of the body region (FIH offset 0x10000).
+        BinaryPrimitives.WriteUInt64BigEndian(cntMetadata.AsSpan(0x410), HeaderRegionSize);
+
+        long superblockOffset = (long)outerSuperblockIndex * HeaderRegionSize;
+        ulong embeddedCntOffset = HeaderRegionSize + (ulong)pfsImageSize;
+        byte[] header = BuildHeaderBlockFromSuperblock(
+            variant, (ulong)pfsImageSize, embeddedCntOffset, superblockBlock, superblockOffset,
+            nestedImageDigest, nestedImageSize, nestedMetaBaseBlocks, contentVersionHi,
+            innerContentInodes, appFileCount, metaBlockCount, metaBlockCountMirror,
+            emptyFileCount, sparseAfidHoleCount);
+
+        string full = Path.GetFullPath(outputPath);
+        using var outFs = new FileStream(full, FileMode.Open, FileAccess.ReadWrite, FileShare.None,
+            1 << 20, FileOptions.None);
+        outFs.Position = 0;
+        outFs.Write(header, 0, header.Length);
+        outFs.Position = HeaderRegionSize + pfsImageSize;
+        outFs.Write(cntMetadata, 0, cntMetadata.Length);
+        outFs.Flush();
+        long mountLength = outFs.Length;
+
+        if (siFactory is not null)
+        {
+            byte[] si = siFactory(outFs, mountLength);
+            if (si is { Length: > 0 })
+            {
+                outFs.Position = mountLength;
+                outFs.Write(si, 0, si.Length);
+            }
+        }
+        outFs.Flush();
+    }
+
+    /// <summary>
     /// Locates the plaintext outer superblock within a streamed region (version u64 == 2 at +0x00
     /// and magic 0x0B2A3301 at +0x08), returning the byte offset relative to
     /// <paramref name="start"/>, or -1.

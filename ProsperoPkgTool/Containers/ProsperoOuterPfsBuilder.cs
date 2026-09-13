@@ -411,12 +411,14 @@ public static class ProsperoOuterPfsBuilder
     public static OuterPfsFileBuildResult BuildForPackageToFile(
         IReadOnlyList<OuterPfsFileSource> files, OuterPfsBuildParameters parameters,
         string outputPath, bool encryptOutput, ReadOnlySpan<byte> tweakKey, ReadOnlySpan<byte> dataKey,
-        IProgress<ProsperoBuildProgress>? progress = null)
+        IProgress<ProsperoBuildProgress>? progress = null, long outputOffset = 0)
     {
         ArgumentNullException.ThrowIfNull(files);
         ArgumentNullException.ThrowIfNull(parameters);
         if (files.Count == 0)
             throw new ArgumentException("At least one outer file is required.", nameof(files));
+        if (outputOffset < 0 || outputOffset % BlockSize != 0)
+            throw new ArgumentOutOfRangeException(nameof(outputOffset), "The outer-PFS output offset must be block-aligned.");
 
         string full = Path.GetFullPath(outputPath);
         Directory.CreateDirectory(Path.GetDirectoryName(full) ?? Directory.GetCurrentDirectory());
@@ -477,9 +479,9 @@ public static class ProsperoOuterPfsBuilder
         using (var outFs = new FileStream(full, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan))
         using (var xts = encryptOutput ? new AesXts(dataKey, tweakKey) : null)
         {
-            outFs.SetLength(imageLength);
+            outFs.SetLength(checked(outputOffset + imageLength));
             WriteDataBlocks(outFs, files, fileFirstBlock, fileBlockCount, dataBlockTotal,
-                encryptOutput, tweakKey, dataKey, parallelism, imageDigests, progress);
+                encryptOutput, tweakKey, dataKey, parallelism, imageDigests, outputOffset, progress);
 
             // ---- 3. Structural metadata blocks (need the data digests captured above). ----
             byte[] superRootBlock = new byte[BlockSize];
@@ -544,16 +546,16 @@ public static class ProsperoOuterPfsBuilder
             kinds[urootDirentIndex] = OuterBlockKind.Signed;
 
             // ---- 5. Write the metadata blocks. ----
-            WriteBlock(outFs, superblockIndex, superblock, OuterBlockKind.Plaintext, encryptOutput, xts);
-            WriteBlock(outFs, inodeTableIndex, inodeTable, OuterBlockKind.Signed, encryptOutput, xts);
-            WriteBlock(outFs, superRootDirentIndex, superRootBlock, OuterBlockKind.Signed, encryptOutput, xts);
-            WriteBlock(outFs, fltIndex, fltBlock, OuterBlockKind.Signed, encryptOutput, xts);
+            WriteBlock(outFs, superblockIndex, superblock, OuterBlockKind.Plaintext, encryptOutput, xts, outputOffset);
+            WriteBlock(outFs, inodeTableIndex, inodeTable, OuterBlockKind.Signed, encryptOutput, xts, outputOffset);
+            WriteBlock(outFs, superRootDirentIndex, superRootBlock, OuterBlockKind.Signed, encryptOutput, xts, outputOffset);
+            WriteBlock(outFs, fltIndex, fltBlock, OuterBlockKind.Signed, encryptOutput, xts, outputOffset);
             for (int b = 0; b < indirectBlocksTotal; b++)
             {
                 byte[] ib = indirectRegion!.AsSpan(b * BlockSize, BlockSize).ToArray();
-                WriteBlock(outFs, indirectRegionStart + b, ib, OuterBlockKind.Signed, encryptOutput, xts);
+                WriteBlock(outFs, indirectRegionStart + b, ib, OuterBlockKind.Signed, encryptOutput, xts, outputOffset);
             }
-            WriteBlock(outFs, urootDirentIndex, urootBlock, OuterBlockKind.Signed, encryptOutput, xts);
+            WriteBlock(outFs, urootDirentIndex, urootBlock, OuterBlockKind.Signed, encryptOutput, xts, outputOffset);
             outFs.Flush();
         }
 
@@ -586,7 +588,7 @@ public static class ProsperoOuterPfsBuilder
         FileStream outFs, IReadOnlyList<OuterPfsFileSource> files,
         int[] fileFirstBlock, int[] fileBlockCount, int dataBlockTotal,
         bool encryptOutput, ReadOnlySpan<byte> tweakKey, ReadOnlySpan<byte> dataKey,
-        int parallelism, byte[] imageDigests, IProgress<ProsperoBuildProgress>? progress)
+        int parallelism, byte[] imageDigests, long outputOffset, IProgress<ProsperoBuildProgress>? progress)
     {
         int processedBlocks = 0;
         if (parallelism <= 1 || !encryptOutput)
@@ -595,7 +597,7 @@ public static class ProsperoOuterPfsBuilder
             for (int i = 0; i < files.Count; i++)
             {
                 OuterBlockKind kind = files[i].Signed ? OuterBlockKind.Signed : OuterBlockKind.Data;
-                outFs.Position = (long)fileFirstBlock[i] * BlockSize;
+                outFs.Position = outputOffset + (long)fileFirstBlock[i] * BlockSize;
                 using var src = new FileStream(files[i].Path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
                 using var xts = encryptOutput ? new AesXts(dataKey, tweakKey) : null;
                 for (int j = 0; j < fileBlockCount[i]; j++)
@@ -644,7 +646,7 @@ public static class ProsperoOuterPfsBuilder
                         return local;
                     },
                     local => local.Dispose());
-                outFs.Position = (long)baseIndex * BlockSize;
+                outFs.Position = outputOffset + (long)baseIndex * BlockSize;
                 for (int k = 0; k < count; k++)
                     outFs.Write(buffers[k], 0, BlockSize);
                 processedBlocks += count;
@@ -663,9 +665,9 @@ public static class ProsperoOuterPfsBuilder
     }
 
     private static void WriteBlock(FileStream fs, int blockIndex, byte[] plaintext,
-        OuterBlockKind kind, bool encryptOutput, AesXts? xts)
+        OuterBlockKind kind, bool encryptOutput, AesXts? xts, long outputOffset)
     {
-        fs.Position = (long)blockIndex * BlockSize;
+        fs.Position = outputOffset + (long)blockIndex * BlockSize;
         if (encryptOutput && kind != OuterBlockKind.Plaintext)
         {
             byte[] cipher = kind == OuterBlockKind.Signed

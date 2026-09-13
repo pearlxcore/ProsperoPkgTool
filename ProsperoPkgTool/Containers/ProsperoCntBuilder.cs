@@ -203,6 +203,20 @@ public sealed class ProsperoCntBuilder
         outFs.Flush();
     }
 
+    /// <summary>
+    /// Builds only the CNT metadata region (header + entry table + body) for an <b>external</b> PFS
+    /// image and returns it, without copying the image. Used by the prepositioned file-backed
+    /// pipeline, where the outer PFS is written directly into its final FIH range and this metadata
+    /// is appended immediately after it. The 0x410 pfs-image offset is rewritten by the FIH finalizer.
+    /// </summary>
+    public static byte[] BuildMetadata(
+        IReadOnlyList<Entry> entries, CntBuildParameters parameters, long pfsImageLength,
+        byte[] imageSeed, byte[] pfsImageDigest, byte[]? pfsSignedDigest = null)
+    {
+        (byte[] prefix, _) = BuildPrefix(entries, parameters, pfsImageLength, imageSeed, pfsImageDigest, pfsSignedDigest);
+        return prefix;
+    }
+
     private static (byte[] Prefix, ulong PfsImageOffset) BuildPrefix(
         IReadOnlyList<Entry> entries, CntBuildParameters parameters, long pfsImageLength,
         byte[] imageSeed, byte[] pfsImageDigest, byte[]? pfsSignedDigest)
