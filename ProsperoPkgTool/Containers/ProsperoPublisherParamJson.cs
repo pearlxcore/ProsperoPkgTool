@@ -129,6 +129,41 @@ public static class ProsperoPublisherParamJson
     }
 
     /// <summary>
+    /// Rewrites only <c>applicationDrmType</c> in a source <c>param.json</c>. Every other field is
+    /// preserved; the document is re-serialized with the same canonical conventions as
+    /// <see cref="ApplySdkOverride"/> (sorted keys, CRLF, no BOM). Used for an explicit DRM override;
+    /// the builder otherwise packages the source token verbatim.
+    /// </summary>
+    /// <param name="sourceParamJson">Raw source <c>sce_sys/param.json</c> bytes.</param>
+    /// <param name="drmType">DRM token to stamp; for example <c>standard</c>.</param>
+    public static byte[] ApplyDrmType(ReadOnlySpan<byte> sourceParamJson, string drmType)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(drmType);
+        JsonNode node;
+        try
+        {
+            node = JsonNode.Parse(sourceParamJson) ?? throw new InvalidDataException("sce_sys/param.json is empty.");
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidDataException("sce_sys/param.json is not valid JSON.", ex);
+        }
+        if (node is not JsonObject root)
+            throw new InvalidDataException("sce_sys/param.json must contain a JSON object.");
+
+        root["applicationDrmType"] = drmType;
+
+        string text = SortOrdinal(root).ToJsonString(new JsonSerializerOptions
+        {
+            WriteIndented = true,
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        });
+        text = text.Replace("\r\n", "\n", StringComparison.Ordinal)
+                   .Replace("\n", "\r\n", StringComparison.Ordinal) + "\r\n";
+        return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false).GetBytes(text);
+    }
+
+    /// <summary>
     /// Resolves the SDK version from a source <c>eboot.bin</c>: an ELF <c>.sceversion</c> section, or
     /// the trailer appended to a publisher fake-SELF. Returns zero when nothing can be read.
     /// </summary>

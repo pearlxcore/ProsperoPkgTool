@@ -568,6 +568,7 @@ public static class CliApplication
         int krakenLevel = KrakenTuning.DefaultLevel;
         int krakenThreads = 0;
         ulong? sdkVersionOverride = null;
+        string? drmTypeOverride = null;
         bool sweepTemp = true;
         int staleHours = 12;
         string? tempDir = null;
@@ -610,6 +611,9 @@ public static class CliApplication
                 case "--sdk" when i + 1 < args.Length:
                     sdkVersionOverride = ParseSdkOption(args[++i]);
                     break;
+                case "--drm-type" when i + 1 < args.Length:
+                    drmTypeOverride = ParseDrmTypeOption(args[++i]);
+                    break;
                 case "--no-temp-sweep":
                     sweepTemp = false;
                     break;
@@ -637,7 +641,7 @@ public static class CliApplication
         }
         if (backup is null || output is null)
         {
-            Console.Error.WriteLine("Usage: ProsperoPkgTool convert <backup-folder> --out <package.pkg> [--decrypted <subfolder>] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--compression stored|kraken] [--kraken-level -4..9] [--kraken-threads <n|0=auto>] [--sdk <major|0x-id>] [--no-temp-sweep] [--stale-hours <n>] [--temp <dir>] [--staging <folder>] [--keep-staging] [--use-embedded-right-sprx] [--verbose]");
+            Console.Error.WriteLine("Usage: ProsperoPkgTool convert <backup-folder> --out <package.pkg> [--decrypted <subfolder>] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--compression stored|kraken] [--kraken-level -4..9] [--kraken-threads <n|0=auto>] [--sdk <major|0x-id>] [--drm-type <token>] [--no-temp-sweep] [--stale-hours <n>] [--temp <dir>] [--staging <folder>] [--keep-staging] [--use-embedded-right-sprx] [--verbose]");
             return 2;
         }
 
@@ -677,6 +681,11 @@ public static class CliApplication
             {
                 buildArgs.Add("--sdk");
                 buildArgs.Add("0x" + sdkValue.ToString("X16", System.Globalization.CultureInfo.InvariantCulture));
+            }
+            if (!string.IsNullOrWhiteSpace(drmTypeOverride))
+            {
+                buildArgs.Add("--drm-type");
+                buildArgs.Add(drmTypeOverride);
             }
             if (!sweepTemp) buildArgs.Add("--no-temp-sweep");
             if (staleHours != 12)
@@ -731,6 +740,7 @@ public static class CliApplication
         int krakenThreads = 0;
         byte[]? outerSeed = null;
         ulong? sdkVersionOverride = null;
+        string? drmTypeOverride = null;
         bool sweepTemp = true;
         int staleHours = 12;
         int playGoChunks = 1;
@@ -777,6 +787,9 @@ public static class CliApplication
                 case "--sdk" when i + 1 < args.Length:
                     sdkVersionOverride = ParseSdkOption(args[++i]);
                     break;
+                case "--drm-type" when i + 1 < args.Length:
+                    drmTypeOverride = ParseDrmTypeOption(args[++i]);
+                    break;
                 case "--no-temp-sweep":
                     sweepTemp = false;
                     break;
@@ -807,7 +820,7 @@ public static class CliApplication
         }
         if (source is null || output is null)
         {
-            Console.Error.WriteLine("Usage: ProsperoPkgTool img_create <source-folder | project.gp5> --out <package.pkg> [--type base] [--compression stored|kraken] [--kraken-level -4..9] [--kraken-threads <n|0=auto>] [--seed <32-hex>] [--sdk <major|0x-id>] [--no-temp-sweep] [--stale-hours <n>] [--temp <dir>] [--playgo-chunks <n>] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--no_fself] [--no_right_sprx] [--verbose]");
+            Console.Error.WriteLine("Usage: ProsperoPkgTool img_create <source-folder | project.gp5> --out <package.pkg> [--type base] [--compression stored|kraken] [--kraken-level -4..9] [--kraken-threads <n|0=auto>] [--seed <32-hex>] [--sdk <major|0x-id>] [--drm-type <token>] [--no-temp-sweep] [--stale-hours <n>] [--temp <dir>] [--playgo-chunks <n>] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--no_fself] [--no_right_sprx] [--verbose]");
             return 2;
         }
 
@@ -943,6 +956,7 @@ public static class CliApplication
             OuterSeed = outerSeed,
             DeterministicEntryKeys = outerSeed is not null,
             SdkVersionOverride = sdkVersionOverride,
+            DrmTypeOverride = drmTypeOverride,
             SweepStaleTempWorkspaces = sweepTemp,
             StaleWorkspaceHours = staleHours,
             TempDirectory = tempDir,
@@ -1398,6 +1412,15 @@ public static class CliApplication
         ProsperoSdkVersions.TryParse(value, out ulong sdkVersion)
             ? sdkVersion
             : throw new ArgumentException("--sdk expects a major (9), a dotted version (9.00.00.40) or a 0x 64-bit identifier.");
+
+    /// <summary>
+    /// Parses a DRM override token (<c>--drm-type</c>); any non-blank token is accepted and preserved
+    /// verbatim, matching the lenient treatment of source <c>applicationDrmType</c> values.
+    /// </summary>
+    private static string ParseDrmTypeOption(string value) =>
+        string.IsNullOrWhiteSpace(value)
+            ? throw new ArgumentException("--drm-type expects a DRM token such as 'standard'.")
+            : value.Trim();
 
     private static (byte[] InnerImage, byte[] Naps) ReadInnerImageAndNaps(
         string package, string? passcode, bool noPasscode)

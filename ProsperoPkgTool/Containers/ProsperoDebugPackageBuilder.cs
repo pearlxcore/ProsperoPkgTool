@@ -114,6 +114,13 @@ public sealed class DebugPackageBuildOptions
     /// </summary>
     public ulong? SdkVersionOverride { get; init; }
 
+    /// <summary>
+    /// Explicit <c>applicationDrmType</c> token to stamp into the packaged <c>sce_sys/param.json</c>.
+    /// Null (the default) preserves the source token verbatim; set it (for example <c>standard</c>)
+    /// to override a source value the console would otherwise show as locked.
+    /// </summary>
+    public string? DrmTypeOverride { get; init; }
+
     /// <summary>Console/progress surface. Optional.</summary>
     public DebugPackageBuildLog? Log { get; init; }
 }
@@ -186,6 +193,14 @@ public static class ProsperoDebugPackageBuilder
         {
             paramJson = ProsperoPublisherParamJson.ApplySdkOverride(paramJson, sdkVersion);
             console.Log($"  SDK override: executable 0x{sdkVersion:X16}, package 0x{ProsperoSdkVersions.ToPackageVersion(sdkVersion):X16}");
+        }
+
+        // An explicit DRM override is the other opt-in exception: it rewrites only applicationDrmType
+        // so a source token the console treats as locked can be forced to a launchable value.
+        if (!string.IsNullOrWhiteSpace(options.DrmTypeOverride))
+        {
+            paramJson = ProsperoPublisherParamJson.ApplyDrmType(paramJson, options.DrmTypeOverride);
+            console.Log($"  DRM type override: {options.DrmTypeOverride}");
         }
 
         var innerFiles = new List<ProsperoInnerImageAssembler.InnerFile>(files);
@@ -270,6 +285,13 @@ public static class ProsperoDebugPackageBuilder
             return ProsperoPlayGoChunkBuilder.CreateProject(contentId, chunkCount);
         }
     }
+
+    /// <summary>
+    /// The DRM token used for the SI/CNT-derived metadata: the explicit override when set, otherwise
+    /// the source <c>param.json</c> value (or null when absent).
+    /// </summary>
+    private static string? EffectiveDrmType(DebugPackageBuildOptions options, ProsperoParam param) =>
+        string.IsNullOrWhiteSpace(options.DrmTypeOverride) ? param.ApplicationDrmType : options.DrmTypeOverride;
 
     /// <summary>
     /// FIH 0x9C: the content-version major encoded as BCD in the top byte of the high dword
@@ -419,7 +441,7 @@ public static class ProsperoDebugPackageBuilder
         // Generated entries (PlayGo family, param.json) win over a source-supplied duplicate id.
         // The media entries sit between playgo-chunk.dat and the hash-table/ficm pair, matching the
         // Sony container's on-disk entry order.
-        foreach (ProsperoSceSysMedia.Entry media in ProsperoSceSysMedia.Collect(sceSysFiles, param.ApplicationDrmType))
+        foreach (ProsperoSceSysMedia.Entry media in ProsperoSceSysMedia.Collect(sceSysFiles, EffectiveDrmType(buildOptions, param)))
         {
             if (entries.Any(e => (uint)e.Id == (uint)media.Id))
                 continue;
@@ -493,7 +515,7 @@ public static class ProsperoDebugPackageBuilder
 
         byte[]? playGoChunkDat = entries.FirstOrDefault(e => e.Id == CntEntryId.PlaygoChunkDat)?.Data;
         byte[] siSegment = BuildSiSegment(
-            contentId, param, cnt, entries, outerFiles, outerBuild, outerSeed, superblockIcv,
+            contentId, EffectiveDrmType(buildOptions, param) ?? "free", param, cnt, entries, outerFiles, outerBuild, outerSeed, superblockIcv,
             innerResult, fihNoSi, paramJson, playGoChunkDat);
 
         byte[] fih = ProsperoFihBuilder.BuildFromCnt(
@@ -615,7 +637,7 @@ public static class ProsperoDebugPackageBuilder
 
             // Media entries sit between playgo-chunk.dat and the hash-table/ficm pair, matching the
             // Sony container's on-disk entry order.
-            foreach (ProsperoSceSysMedia.Entry media in ProsperoSceSysMedia.Collect(sceSysFiles, param.ApplicationDrmType))
+            foreach (ProsperoSceSysMedia.Entry media in ProsperoSceSysMedia.Collect(sceSysFiles, EffectiveDrmType(buildOptions, param)))
             {
                 if (entries.Any(e => (uint)e.Id == (uint)media.Id))
                     continue;
@@ -711,7 +733,7 @@ public static class ProsperoDebugPackageBuilder
                     .Select(n => (n.FullPath.TrimStart('/'), n.Size))
                     .ToList();
 
-                string applicationDrmType = param.ApplicationDrmType ?? "free";
+                string applicationDrmType = EffectiveDrmType(buildOptions, param) ?? "free";
                 var xmlOptions = new ProsperoPfsImageXmlOptions
                 {
                     ContentId = contentId,
@@ -832,7 +854,7 @@ public static class ProsperoDebugPackageBuilder
     /// that the builder has already written are read back; nothing is fabricated.
     /// </summary>
     private static byte[] BuildSiSegment(
-        string contentId, ProsperoParam param,
+        string contentId, string applicationDrmType, ProsperoParam param,
         byte[] cnt, IReadOnlyList<ProsperoCntBuilder.Entry> entries,
         IReadOnlyList<OuterPfsFile> outerFiles, OuterPfsBuildResult outerBuild, byte[] outerSeed,
         byte[] superblockIcv,
@@ -900,7 +922,6 @@ public static class ProsperoDebugPackageBuilder
 
         string contentVersion = param.ContentVersion ?? "01.000.000";
         string titleName = param.TitleName ?? "";
-        string applicationDrmType = param.ApplicationDrmType ?? "free";
         string masterVersion = "01.00";
 
         var xmlOptions = new ProsperoPfsImageXmlOptions
