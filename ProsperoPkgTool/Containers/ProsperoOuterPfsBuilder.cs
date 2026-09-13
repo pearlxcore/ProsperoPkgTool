@@ -52,6 +52,12 @@ public sealed class OuterPfsBuildParameters
 
     /// <summary>The 16-byte crypt seed written at superblock+0x370 (and used for key derivation).</summary>
     public byte[]? Seed { get; init; }
+
+    /// <summary>
+    /// Worker threads for the per-block SHA3 and AES-XTS passes; 0 (the default) uses the processor
+    /// count. The produced image bytes are independent of the thread count.
+    /// </summary>
+    public int BlockParallelism { get; init; }
 }
 
 /// <summary>Result of building the plaintext outer-PFS image (assembled + signed, not encrypted).</summary>
@@ -454,19 +460,11 @@ public static class ProsperoOuterPfsBuilder
 
         var imageDigests = new byte[totalBlocks * 32];
 
-        // ---- 2. Hash every data block (one pass over the sources). ----
-        byte[] block = new byte[BlockSize];
-        for (int i = 0; i < files.Count; i++)
-        {
-            using var src = new FileStream(files[i].Path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
-            for (int j = 0; j < fileBlockCount[i]; j++)
-            {
-                int read = ReadBlock(src, block);
-                if (read < BlockSize)
-                    block.AsSpan(read).Clear();
-                Sha3.Sha3_256(block).CopyTo(imageDigests, (fileFirstBlock[i] + j) * 32);
-            }
-        }
+        // ---- 2. Hash every data block, parallelising the SHA3 work. ----
+        int parallelism = parameters.BlockParallelism <= 0
+            ? Environment.ProcessorCount
+            : Math.Clamp(parameters.BlockParallelism, 1, 256);
+        HashDataBlocks(files, fileFirstBlock, fileBlockCount, imageDigests, parallelism);
 
         // ---- 3. Structural metadata blocks (in memory). ----
         byte[] superRootBlock = new byte[BlockSize];
@@ -535,24 +533,8 @@ public static class ProsperoOuterPfsBuilder
         using (var xts = encryptOutput ? new AesXts(dataKey, tweakKey) : null)
         {
             outFs.SetLength(imageLength);
-            int processedBlocks = 0;
-            for (int i = 0; i < files.Count; i++)
-            {
-                OuterBlockKind kind = files[i].Signed ? OuterBlockKind.Signed : OuterBlockKind.Data;
-                outFs.Position = (long)fileFirstBlock[i] * BlockSize;
-                using var src = new FileStream(files[i].Path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
-                for (int j = 0; j < fileBlockCount[i]; j++)
-                {
-                    int blockIndex = fileFirstBlock[i] + j;
-                    int read = ReadBlock(src, block);
-                    if (read < BlockSize)
-                        block.AsSpan(read).Clear();
-                    if (encryptOutput)
-                        block = ApplyXts(xts!, block, kind, blockIndex);
-                    outFs.Write(block, 0, BlockSize);
-                    progress?.Report(new ProsperoBuildProgress("Outer PFS", ++processedBlocks, dataBlockTotal));
-                }
-            }
+            WriteDataBlocks(outFs, files, fileFirstBlock, fileBlockCount, dataBlockTotal,
+                encryptOutput, tweakKey, dataKey, parallelism, progress);
 
             WriteBlock(outFs, superblockIndex, superblock, OuterBlockKind.Plaintext, encryptOutput, xts);
             WriteBlock(outFs, inodeTableIndex, inodeTable, OuterBlockKind.Signed, encryptOutput, xts);
@@ -586,6 +568,130 @@ public static class ProsperoOuterPfsBuilder
     }
 
     /// <summary>Encrypts one block for its kind and returns the ciphertext (Data/Signed only).</summary>
+    /// <summary>
+    /// Records SHA3-256 of every plaintext data block into <paramref name="imageDigests"/>. Reads each
+    /// source sequentially and hashes a small window of blocks concurrently; the digest table is
+    /// independent of the thread count.
+    /// </summary>
+    private static void HashDataBlocks(
+        IReadOnlyList<OuterPfsFileSource> files, int[] fileFirstBlock, int[] fileBlockCount,
+        byte[] imageDigests, int parallelism)
+    {
+        byte[] block = new byte[BlockSize];
+        if (parallelism <= 1)
+        {
+            for (int i = 0; i < files.Count; i++)
+            {
+                using var src = new FileStream(files[i].Path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
+                for (int j = 0; j < fileBlockCount[i]; j++)
+                {
+                    int read = ReadBlock(src, block);
+                    if (read < BlockSize)
+                        block.AsSpan(read).Clear();
+                    Sha3.Sha3_256(block).CopyTo(imageDigests, (fileFirstBlock[i] + j) * 32);
+                }
+            }
+            return;
+        }
+
+        int window = Math.Max(parallelism, 8);
+        byte[][] buffers = new byte[window][];
+        for (int k = 0; k < window; k++)
+            buffers[k] = new byte[BlockSize];
+        var options = new ParallelOptions { MaxDegreeOfParallelism = parallelism };
+        for (int i = 0; i < files.Count; i++)
+        {
+            using var src = new FileStream(files[i].Path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
+            for (int start = 0; start < fileBlockCount[i]; start += window)
+            {
+                int count = Math.Min(window, fileBlockCount[i] - start);
+                for (int k = 0; k < count; k++)
+                {
+                    int read = ReadBlock(src, buffers[k]);
+                    if (read < BlockSize)
+                        buffers[k].AsSpan(read).Clear();
+                }
+                int baseIndex = fileFirstBlock[i] + start;
+                Parallel.For(0, count, options, k =>
+                    Sha3.Sha3_256(buffers[k]).CopyTo(imageDigests, (baseIndex + k) * 32));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Writes the file-data blocks at their planned offsets, encrypting signed/data blocks with
+    /// AES-XTS. Reading and writing are sequential; the AES-XTS work runs concurrently over a bounded
+    /// window, so peak memory stays at a few blocks and the bytes are identical to a serial write.
+    /// </summary>
+    private static void WriteDataBlocks(
+        FileStream outFs, IReadOnlyList<OuterPfsFileSource> files,
+        int[] fileFirstBlock, int[] fileBlockCount, int dataBlockTotal,
+        bool encryptOutput, ReadOnlySpan<byte> tweakKey, ReadOnlySpan<byte> dataKey,
+        int parallelism, IProgress<ProsperoBuildProgress>? progress)
+    {
+        int processedBlocks = 0;
+        if (parallelism <= 1 || !encryptOutput)
+        {
+            byte[] block = new byte[BlockSize];
+            for (int i = 0; i < files.Count; i++)
+            {
+                OuterBlockKind kind = files[i].Signed ? OuterBlockKind.Signed : OuterBlockKind.Data;
+                outFs.Position = (long)fileFirstBlock[i] * BlockSize;
+                using var src = new FileStream(files[i].Path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
+                using var xts = encryptOutput ? new AesXts(dataKey, tweakKey) : null;
+                for (int j = 0; j < fileBlockCount[i]; j++)
+                {
+                    int blockIndex = fileFirstBlock[i] + j;
+                    int read = ReadBlock(src, block);
+                    if (read < BlockSize)
+                        block.AsSpan(read).Clear();
+                    if (encryptOutput)
+                        block = ApplyXts(xts!, block, kind, blockIndex);
+                    outFs.Write(block, 0, BlockSize);
+                    progress?.Report(new ProsperoBuildProgress("Outer PFS", ++processedBlocks, dataBlockTotal));
+                }
+            }
+            return;
+        }
+
+        byte[] tweak = tweakKey.ToArray();
+        byte[] data = dataKey.ToArray();
+        int window = Math.Max(parallelism, 8);
+        byte[][] buffers = new byte[window][];
+        for (int k = 0; k < window; k++)
+            buffers[k] = new byte[BlockSize];
+        var options = new ParallelOptions { MaxDegreeOfParallelism = parallelism };
+        for (int i = 0; i < files.Count; i++)
+        {
+            OuterBlockKind kind = files[i].Signed ? OuterBlockKind.Signed : OuterBlockKind.Data;
+            using var src = new FileStream(files[i].Path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
+            for (int start = 0; start < fileBlockCount[i]; start += window)
+            {
+                int count = Math.Min(window, fileBlockCount[i] - start);
+                for (int k = 0; k < count; k++)
+                {
+                    int read = ReadBlock(src, buffers[k]);
+                    if (read < BlockSize)
+                        buffers[k].AsSpan(read).Clear();
+                }
+                int baseIndex = fileFirstBlock[i] + start;
+                Parallel.For(0, count, options,
+                    () => new AesXts(data, tweak),
+                    (k, _, local) =>
+                    {
+                        buffers[k] = ApplyXts(local, buffers[k], kind, baseIndex + k);
+                        return local;
+                    },
+                    local => local.Dispose());
+                outFs.Position = (long)baseIndex * BlockSize;
+                for (int k = 0; k < count; k++)
+                    outFs.Write(buffers[k], 0, BlockSize);
+                processedBlocks += count;
+                progress?.Report(new ProsperoBuildProgress("Outer PFS", processedBlocks, dataBlockTotal));
+            }
+        }
+    }
+
     private static byte[] ApplyXts(AesXts xts, byte[] plaintext, OuterBlockKind kind, int blockIndex)
     {
         ulong sector = kind == OuterBlockKind.Signed

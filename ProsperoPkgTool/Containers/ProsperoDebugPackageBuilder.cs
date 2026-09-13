@@ -578,7 +578,7 @@ public static class ProsperoDebugPackageBuilder
                     Signed = true,
                 },
             };
-            var outerParams = new OuterPfsBuildParameters { TimestampSeconds = tsSec, TimestampNanoseconds = tsNsec, Seed = outerSeed };
+            var outerParams = new OuterPfsBuildParameters { TimestampSeconds = tsSec, TimestampNanoseconds = tsNsec, Seed = outerSeed, BlockParallelism = krakenThreads };
             (byte[] outerTweakKey, byte[] outerDataKey) = ProsperoKeys.DeriveOuterPfsXtsKeys(ekpfs, outerSeed);
             OuterPfsFileBuildResult outerBuild = ProsperoOuterPfsBuilder.BuildForPackageToFile(
                 outerSources, outerParams, outerPath, encryptOutput: true, outerTweakKey, outerDataKey, progress: console.Progress);
