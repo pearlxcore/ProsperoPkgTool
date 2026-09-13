@@ -668,6 +668,9 @@ public static class CliApplication
         log.Write($"Output: {outputPath}");
         log.Write($"Compression: {(compressionMode == ProsperoInnerCompressionMode.Stored ? "stored" : "kraken")}, " +
             $"level {krakenLevel}, threads {(krakenThreads == 0 ? "auto" : krakenThreads.ToString(System.Globalization.CultureInfo.InvariantCulture))}");
+        if (compressionMode != ProsperoInnerCompressionMode.Stored)
+            log.Write("Note: the clean-room Kraken encoder uses a single fixed strategy; the level is stored in the " +
+                "image header but does not change the compressed size (only native Oodle acts on it).");
 
         var console = new ConsoleProgress(verbose, log);
 
