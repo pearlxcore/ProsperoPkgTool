@@ -87,6 +87,13 @@ public sealed class DebugPackageBuildOptions
     /// <summary>Inject the fixed debug <c>sce_sys/about/right.sprx</c> when absent.</summary>
     public bool InjectRightSprx { get; init; } = true;
 
+    /// <summary>
+    /// Full 64-bit executable SDK identifier to stamp into <c>sce_sys/param.json</c> (<c>sdkVersion</c>
+    /// and clamped <c>requiredSystemSoftwareVersion</c>) and into every fake-signed module's
+    /// <c>.sceversion</c> metadata. Null preserves the source metadata verbatim.
+    /// </summary>
+    public ulong? SdkVersionOverride { get; init; }
+
     /// <summary>Console/progress surface. Optional.</summary>
     public DebugPackageBuildLog? Log { get; init; }
 }
@@ -129,14 +136,20 @@ public static class ProsperoDebugPackageBuilder
         ProsperoParam param = ProsperoParamReader.Read(options.ParamJson);
 
         // The source param.json is packaged verbatim: the Sony fixture carries the publisher document
-        // unchanged, so the builder does not re-serialize, reorder, or stamp any field.
+        // unchanged, so the builder does not re-serialize, reorder, or stamp any field. An explicit SDK
+        // override is the one opt-in exception: it rewrites only the SDK fields.
         byte[] paramJson = options.ParamJson;
+        if (options.SdkVersionOverride is { } sdkVersion)
+        {
+            paramJson = ProsperoPublisherParamJson.ApplySdkOverride(paramJson, sdkVersion);
+            console.Log($"  SDK override: executable 0x{sdkVersion:X16}, package 0x{ProsperoSdkVersions.ToPackageVersion(sdkVersion):X16}");
+        }
 
         var innerFiles = new List<ProsperoInnerImageAssembler.InnerFile>(files);
 
         // Convert raw ELF application modules to debug fake-SELF containers (scene method).
         if (options.FakeSignModules)
-            FakeSignInnerModules(innerFiles, console);
+            FakeSignInnerModules(innerFiles, console, options.SdkVersionOverride);
 
         // Inject the debug pfs-version marker if the source doesn't ship one (scene method): ASCII
         // content-version string, e.g. "01.000.000".
@@ -1011,7 +1024,8 @@ public static class ProsperoDebugPackageBuilder
     /// application's <c>.sceversion</c> record so the console can validate the SDK version.
     /// </summary>
     private static void FakeSignInnerModules(
-        List<ProsperoInnerImageAssembler.InnerFile> innerFiles, DebugPackageBuildLog console)
+        List<ProsperoInnerImageAssembler.InnerFile> innerFiles, DebugPackageBuildLog console,
+        ulong? sdkVersionOverride)
     {
         byte[]? applicationSceVersion = null;
         int ebootIndex = innerFiles.FindIndex(file =>
@@ -1029,6 +1043,11 @@ public static class ProsperoDebugPackageBuilder
             }
         }
 
+        // An explicit SDK override replaces the module record with the requested identifier, both for
+        // modules that already carry a .sceversion and for stripped ones that inherit the app record.
+        if (sdkVersionOverride is { } overrideVersion)
+            applicationSceVersion = ProsperoSelfBuilder.BuildSdkVersionTuple(overrideVersion);
+
         for (int i = 0; i < innerFiles.Count; i++)
         {
             ProsperoInnerImageAssembler.InnerFile file = innerFiles[i];
@@ -1044,7 +1063,16 @@ public static class ProsperoDebugPackageBuilder
                     continue;
 
                 FselfOptions? options = null;
-                if (!string.Equals(file.Path, "/eboot.bin", StringComparison.Ordinal) &&
+                if (sdkVersionOverride is { } sdkOverride)
+                {
+                    options = new FselfOptions
+                    {
+                        SdkVersionOverride = sdkOverride,
+                        SceVersionName = Path.GetFileNameWithoutExtension(file.Path),
+                        SceVersionRecord = applicationSceVersion,
+                    };
+                }
+                else if (!string.Equals(file.Path, "/eboot.bin", StringComparison.Ordinal) &&
                     applicationSceVersion is not null &&
                     !ProsperoSelfBuilder.TryGetSceVersionRecord(source, out _))
                 {

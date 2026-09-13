@@ -562,6 +562,7 @@ public static class CliApplication
         ProsperoInnerCompressionMode compressionMode = ProsperoInnerCompressionMode.Stored;
         int krakenLevel = KrakenTuning.DefaultLevel;
         int krakenThreads = 0;
+        ulong? sdkVersionOverride = null;
         for (int i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -598,6 +599,9 @@ public static class CliApplication
                 case "--kraken-threads" when i + 1 < args.Length:
                     krakenThreads = ParseIntOption("--kraken-threads", args[++i]);
                     break;
+                case "--sdk" when i + 1 < args.Length:
+                    sdkVersionOverride = ParseSdkOption(args[++i]);
+                    break;
                 case "--keep-staging":
                     keepStaging = true;
                     break;
@@ -616,7 +620,7 @@ public static class CliApplication
         }
         if (backup is null || output is null)
         {
-            Console.Error.WriteLine("Usage: ProsperoPkgTool convert <backup-folder> --out <package.pkg> [--decrypted <subfolder>] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--compression stored|kraken] [--kraken-level -4..9] [--kraken-threads <n|0=auto>] [--staging <folder>] [--keep-staging] [--use-embedded-right-sprx] [--verbose]");
+            Console.Error.WriteLine("Usage: ProsperoPkgTool convert <backup-folder> --out <package.pkg> [--decrypted <subfolder>] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--compression stored|kraken] [--kraken-level -4..9] [--kraken-threads <n|0=auto>] [--sdk <major|0x-id>] [--staging <folder>] [--keep-staging] [--use-embedded-right-sprx] [--verbose]");
             return 2;
         }
 
@@ -652,6 +656,11 @@ public static class CliApplication
             buildArgs.Add(krakenLevel.ToString(System.Globalization.CultureInfo.InvariantCulture));
             buildArgs.Add("--kraken-threads");
             buildArgs.Add(krakenThreads.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            if (sdkVersionOverride is { } sdkValue)
+            {
+                buildArgs.Add("--sdk");
+                buildArgs.Add("0x" + sdkValue.ToString("X16", System.Globalization.CultureInfo.InvariantCulture));
+            }
             if (verbose) buildArgs.Add("--verbose");
 
             int code = RunInnerImageCreate(buildArgs.ToArray());
@@ -692,6 +701,7 @@ public static class CliApplication
         int krakenLevel = KrakenTuning.DefaultLevel;
         int krakenThreads = 0;
         byte[]? outerSeed = null;
+        ulong? sdkVersionOverride = null;
         for (int i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -732,6 +742,9 @@ public static class CliApplication
                 case "--seed" when i + 1 < args.Length:
                     outerSeed = ParseSeedOption(args[++i]);
                     break;
+                case "--sdk" when i + 1 < args.Length:
+                    sdkVersionOverride = ParseSdkOption(args[++i]);
+                    break;
                 case "--no_passcode":
                     noPasscode = true;
                     break;
@@ -750,7 +763,7 @@ public static class CliApplication
         }
         if (source is null || output is null)
         {
-            Console.Error.WriteLine("Usage: ProsperoPkgTool img_create <source-folder | project.gp5> --out <package.pkg> [--type base] [--compression stored|kraken] [--kraken-level -4..9] [--kraken-threads <n|0=auto>] [--seed <32-hex>] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--no_fself] [--no_right_sprx] [--verbose]");
+            Console.Error.WriteLine("Usage: ProsperoPkgTool img_create <source-folder | project.gp5> --out <package.pkg> [--type base] [--compression stored|kraken] [--kraken-level -4..9] [--kraken-threads <n|0=auto>] [--seed <32-hex>] [--sdk <major|0x-id>] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--no_fself] [--no_right_sprx] [--verbose]");
             return 2;
         }
 
@@ -885,6 +898,7 @@ public static class CliApplication
             KrakenThreads = krakenThreads,
             OuterSeed = outerSeed,
             DeterministicEntryKeys = outerSeed is not null,
+            SdkVersionOverride = sdkVersionOverride,
             PlayGo = gp5PlayGo,
             SceSysFiles = sceSysFiles,
             FakeSignModules = fakeSignModules,
@@ -1327,6 +1341,15 @@ public static class CliApplication
             ? seed
             : throw new ArgumentException("--seed must be 32 hexadecimal characters (16 bytes).");
     }
+
+    /// <summary>
+    /// Parses an SDK override value: a major (<c>9</c>), a dotted version (<c>9.00.00.40</c>) or a raw
+    /// 64-bit hex identifier (<c>0x0900004000000411</c>).
+    /// </summary>
+    private static ulong ParseSdkOption(string value) =>
+        ProsperoSdkVersions.TryParse(value, out ulong sdkVersion)
+            ? sdkVersion
+            : throw new ArgumentException("--sdk expects a major (9), a dotted version (9.00.00.40) or a 0x 64-bit identifier.");
 
     private static (byte[] InnerImage, byte[] Naps) ReadInnerImageAndNaps(
         string package, string? passcode, bool noPasscode)

@@ -92,6 +92,43 @@ public static class ProsperoPublisherParamJson
     }
 
     /// <summary>
+    /// Rewrites only the SDK fields of a source <c>param.json</c>: <c>sdkVersion</c> and the clamped
+    /// <c>requiredSystemSoftwareVersion</c>. Every other field is preserved; the document is
+    /// re-serialized with the same canonical conventions as <see cref="Build"/> (sorted keys, CRLF,
+    /// no BOM). Used for an explicit SDK override without re-stamping the whole publisher document.
+    /// </summary>
+    /// <param name="sourceParamJson">Raw source <c>sce_sys/param.json</c> bytes.</param>
+    /// <param name="executableVersion">Full 64-bit executable SDK identifier to apply.</param>
+    public static byte[] ApplySdkOverride(ReadOnlySpan<byte> sourceParamJson, ulong executableVersion)
+    {
+        JsonNode node;
+        try
+        {
+            node = JsonNode.Parse(sourceParamJson) ?? throw new InvalidDataException("sce_sys/param.json is empty.");
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidDataException("sce_sys/param.json is not valid JSON.", ex);
+        }
+        if (node is not JsonObject root)
+            throw new InvalidDataException("sce_sys/param.json must contain a JSON object.");
+
+        ulong packageVersion = executableVersion & 0xFFFF000000000000UL;
+        root["sdkVersion"] = VersionText(packageVersion);
+        ulong required = Math.Max(Math.Min(HexVersion(root["requiredSystemSoftwareVersion"]), RequiredSystemSoftwareVersionCap), packageVersion);
+        root["requiredSystemSoftwareVersion"] = VersionText(required);
+
+        string text = SortOrdinal(root).ToJsonString(new JsonSerializerOptions
+        {
+            WriteIndented = true,
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        });
+        text = text.Replace("\r\n", "\n", StringComparison.Ordinal)
+                   .Replace("\n", "\r\n", StringComparison.Ordinal) + "\r\n";
+        return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false).GetBytes(text);
+    }
+
+    /// <summary>
     /// Resolves the SDK version from a source <c>eboot.bin</c>: an ELF <c>.sceversion</c> section, or
     /// the trailer appended to a publisher fake-SELF. Returns zero when nothing can be read.
     /// </summary>

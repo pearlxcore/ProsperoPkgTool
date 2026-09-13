@@ -128,13 +128,35 @@ public static class ProsperoSelfBuilder
 
         ReadOnlySpan<byte> embeddedSceVersion = FindElfSection(elf, ".sceversion");
         byte[]? synthesized = null;
-        if (embeddedSceVersion.IsEmpty &&
+        byte[]? overridden = null;
+
+        if (options.SdkVersionOverride is { } sdkVersion)
+        {
+            if (!embeddedSceVersion.IsEmpty)
+            {
+                // Overwrite the version tuples of the existing section in place; this preserves the
+                // record layout and the module's own build suffix.
+                byte[] copy = embeddedSceVersion.ToArray();
+                if (TryOverrideSceVersionRecords(copy, sdkVersion))
+                    overridden = copy;
+            }
+            else if (!string.IsNullOrWhiteSpace(options.SceVersionName))
+            {
+                synthesized = BuildSceVersionRecord(options.SceVersionName!, BuildSdkVersionTuple(sdkVersion));
+            }
+        }
+
+        if (synthesized is null && overridden is null &&
+            embeddedSceVersion.IsEmpty &&
             !string.IsNullOrWhiteSpace(options.SceVersionName) &&
             options.SceVersionRecord is { Length: 8 })
         {
             synthesized = BuildSceVersionRecord(options.SceVersionName!, options.SceVersionRecord);
         }
-        ReadOnlySpan<byte> trailer = synthesized ?? embeddedSceVersion;
+
+        ReadOnlySpan<byte> trailer = overridden is not null ? overridden
+            : synthesized is not null ? synthesized
+            : embeddedSceVersion;
 
         byte[] output = new byte[fileSize + trailer.Length];
         Span<byte> span = output;
@@ -230,6 +252,37 @@ public static class ProsperoSelfBuilder
         version.CopyTo(record.AsSpan(5 + name.Length, 8));
         version.CopyTo(record.AsSpan(13 + name.Length, 8));
         return record;
+    }
+
+    /// <summary>The raw eight-byte big-endian SDK tuple for a full executable SDK identifier.</summary>
+    public static byte[] BuildSdkVersionTuple(ulong sdkVersion) => ProsperoSdkVersions.BuildTuple(sdkVersion);
+
+    /// <summary>
+    /// Overwrites the eight-byte version tuple of every record in a <c>.sceversion</c> stream with the
+    /// supplied identifier (big-endian), preserving each record's length and module name. Returns
+    /// <see langword="false"/> when the stream is empty or malformed so the caller can fall back.
+    /// </summary>
+    public static bool TryOverrideSceVersionRecords(Span<byte> records, ulong sdkVersion)
+    {
+        if (records.Length < 4)
+            return false;
+        Span<byte> tuple = stackalloc byte[8];
+        BinaryPrimitives.WriteUInt64BigEndian(tuple, sdkVersion);
+        bool any = false;
+        for (int i = 0; i + 4 <= records.Length;)
+        {
+            int declared = BinaryPrimitives.ReadUInt16LittleEndian(records[(i + 2)..]);
+            int stride = declared + 4;
+            if (declared < 17 || stride > records.Length - i)
+                break;
+            int tupleOffset = i + declared - 12;
+            if (tupleOffset < 0 || tupleOffset + 8 > records.Length)
+                break;
+            tuple.CopyTo(records[tupleOffset..]);
+            any = true;
+            i += stride;
+        }
+        return any;
     }
 
     private static ReadOnlySpan<byte> FindElfSection(byte[] elf, string sectionName)

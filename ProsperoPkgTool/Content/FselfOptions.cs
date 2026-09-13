@@ -26,4 +26,11 @@ public sealed class FselfOptions
     /// twice into a synthesized library record. Required together with <see cref="SceVersionName"/>.
     /// </summary>
     public byte[]? SceVersionRecord { get; init; }
+
+    /// <summary>
+    /// Full 64-bit executable SDK identifier to force into the module's <c>.sceversion</c> metadata.
+    /// When the ELF already carries a <c>.sceversion</c> section its version tuples are overwritten in
+    /// place; when it does not, a fresh record is synthesized from <see cref="SceVersionName"/>.
+    /// </summary>
+    public ulong? SdkVersionOverride { get; init; }
 }
