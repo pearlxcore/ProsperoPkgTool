@@ -301,21 +301,32 @@ public static class ProsperoDebugPackageBuilder
     private static void ReportStage(DebugPackageBuildLog console, ProsperoBuildStage stage) =>
         console.Progress?.Report(new ProsperoBuildProgress(ProsperoBuildStages.Name(stage), 1, 1) { StageId = stage });
 
-    /// <summary>Logs a stage header (e.g. "[stage 1/5] Inner image") and starts its timer.</summary>
+    /// <summary>Logs a stage header (e.g. "[stage 1/5] Building and compressing the inner pfs_image.dat...") and starts its timer.</summary>
     private static void BeginStage(System.Diagnostics.Stopwatch clock, DebugPackageBuildLog console, ProsperoBuildStage stage)
     {
         int index = ProsperoBuildStages.IndexOf(stage);
-        console.Log("");
-        console.Log($"[stage {index + 1}/{ProsperoBuildStages.Build.Count}] {ProsperoBuildStages.Name(stage)}");
+        console.Log($"[stage {index + 1}/{ProsperoBuildStages.Build.Count}] {StageAction(stage)}");
         clock.Restart();
     }
 
-    /// <summary>Logs the elapsed time of the stage just completed.</summary>
-    private static void LogStage(System.Diagnostics.Stopwatch clock, DebugPackageBuildLog console, ProsperoBuildStage stage)
+    /// <summary>Logs the completion of the stage just finished, e.g. "[stage 1/5] Inner image complete: ... in 00:02:39.761.".</summary>
+    private static void LogStage(System.Diagnostics.Stopwatch clock, DebugPackageBuildLog console, ProsperoBuildStage stage, string detail = "")
     {
         int index = ProsperoBuildStages.IndexOf(stage);
-        console.Log($"[stage {index + 1}/{ProsperoBuildStages.Build.Count}] {ProsperoBuildStages.Name(stage)} complete in {clock.Elapsed.TotalSeconds:F1} s");
+        string suffix = detail.Length > 0 ? $": {detail}" : "";
+        console.Log($"[stage {index + 1}/{ProsperoBuildStages.Build.Count}] {ProsperoBuildStages.Name(stage)} complete{suffix} in {clock.Elapsed:hh\\:mm\\:ss\\.fff}.");
     }
+
+    /// <summary>The present-tense action line printed when a stage begins.</summary>
+    private static string StageAction(ProsperoBuildStage stage) => stage switch
+    {
+        ProsperoBuildStage.InnerImage => "Building and compressing the inner pfs_image.dat...",
+        ProsperoBuildStage.Naps => "Generating the NAPS file, block and integrity tables...",
+        ProsperoBuildStage.OuterPfs => "Building and AES-XTS encrypting the outer PFS...",
+        ProsperoBuildStage.Cnt => "Writing the CNT bodies and outer image...",
+        ProsperoBuildStage.Finalize => "Finalizing the CNT into a debug (FIH) image...",
+        _ => ProsperoBuildStages.Name(stage) + "...",
+    };
 
     /// <summary>
     /// FIH 0x9C: the content-version major encoded as BCD in the top byte of the high dword
@@ -384,9 +395,9 @@ public static class ProsperoDebugPackageBuilder
         ProsperoInnerImageAssembler.InnerImageResult innerResult = assembler.Build(
             innerFiles, compressionMode, console.Progress, krakenLevel, krakenThreads);
         console.Finish();
-        console.Log($"    image {innerResult.Image.Length:N0} bytes, {innerResult.Ndblock:N0} mount blocks, {innerResult.InodeCount:N0} inodes");
+        console.Log($" [inner] image {innerResult.Image.Length:N0} bytes, {innerResult.Ndblock:N0} mount blocks, {innerResult.InodeCount:N0} inodes");
         ProsperoCompressionMetrics compression = innerResult.CompressionMetrics;
-        console.Log($"    payload {compression.RawBytes:N0} -> {compression.EncodedBytes:N0} bytes; " +
+        console.Log($" [inner] payload {compression.RawBytes:N0} -> {compression.EncodedBytes:N0} bytes; " +
             $"Kraken {compression.KrakenBlocks}, stored {compression.StoredBlocks}, ratio {compression.Ratio:P2}");
         LogStage(stageClock, console, ProsperoBuildStage.InnerImage);
 
@@ -609,7 +620,7 @@ public static class ProsperoDebugPackageBuilder
             ProsperoInnerImageAssembler.InnerImageResult innerResult =
                 assembler.BuildToFile(innerFiles, innerImagePath, compressionMode, console.Progress, krakenLevel, krakenThreads);
             console.Finish();
-            console.Log($"    image {innerResult.ImageSize:N0} bytes, {innerResult.Ndblock:N0} mount blocks, {innerResult.InodeCount:N0} inodes");
+            console.Log($" [inner] image {innerResult.ImageSize:N0} bytes, {innerResult.Ndblock:N0} mount blocks, {innerResult.InodeCount:N0} inodes");
             ProsperoCompressionMetrics compression = innerResult.CompressionMetrics;
             console.Log($"  Inner payload: {compression.RawBytes} raw -> {compression.EncodedBytes} encoded; " +
                 $"Kraken {compression.KrakenBlocks}, stored {compression.StoredBlocks}, ratio {compression.Ratio:P2}");

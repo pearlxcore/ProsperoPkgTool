@@ -662,7 +662,14 @@ public static class CliApplication
             UseEmbeddedRightSprx = useEmbeddedRightSprx,
         };
 
-        var console = new ConsoleProgress(verbose);
+        var log = new ProsperoConsoleLog();
+        log.Write("Build started");
+        log.Write($"Source folder: {backup}");
+        log.Write($"Output: {outputPath}");
+        log.Write($"Compression: {(compressionMode == ProsperoInnerCompressionMode.Stored ? "stored" : "kraken")}, " +
+            $"level {krakenLevel}, threads {(krakenThreads == 0 ? "auto" : krakenThreads.ToString(System.Globalization.CultureInfo.InvariantCulture))}");
+
+        var console = new ConsoleProgress(verbose, log);
 
         ProsperoBackupConversionResult result = ProsperoBackupConverter.Convert(options, staged =>
         {
@@ -700,28 +707,30 @@ public static class CliApplication
             }
             if (verbose) buildArgs.Add("--verbose");
 
-            int code = RunInnerImageCreate(buildArgs.ToArray());
+            int code = RunInnerImageCreate(buildArgs.ToArray(), log);
             if (code != 0)
                 throw new InvalidDataException($"The package build failed (exit code {code}).");
             return outputPath;
-        }, Console.WriteLine, console);
+        }, log.Write, console);
 
         console.Finish();
-        PrintConversionReport(result);
+        if (File.Exists(outputPath))
+            log.Write($"Build finished in {log.Elapsed}; output {new FileInfo(outputPath).Length:N0} bytes.");
+        PrintConversionReport(result, log);
         return 0;
     }
 
-    private static void PrintConversionReport(ProsperoBackupConversionResult result)
+    private static void PrintConversionReport(ProsperoBackupConversionResult result, ProsperoConsoleLog log)
     {
-        Console.WriteLine($"Output: {result.OutputPath}");
-        Console.WriteLine($"Content ID: {result.DebugLicense.ContentId}");
-        Console.WriteLine($"Passcode: {result.DebugLicense.Passcode}");
-        Console.WriteLine($"Debug license requires rif: {result.DebugLicense.RequiresRif}");
+        log.Write($"Output: {result.OutputPath}");
+        log.Write($"Content ID: {result.DebugLicense.ContentId}");
+        log.Write($"Passcode: {result.DebugLicense.Passcode}");
+        log.Write($"Debug license requires rif: {result.DebugLicense.RequiresRif}");
         if (result.StagingFolder.Length > 0)
-            Console.WriteLine($"Staging folder: {result.StagingFolder}");
+            log.Write($"Staging folder: {result.StagingFolder}");
     }
 
-    private static int RunInnerImageCreate(string[] args)
+    private static int RunInnerImageCreate(string[] args, ProsperoConsoleLog? sharedLog = null)
     {
         string? source = null;
         string? output = null;
@@ -824,7 +833,8 @@ public static class CliApplication
             return 2;
         }
 
-        var console = new ConsoleProgress(verbose);
+        var log = sharedLog ?? new ProsperoConsoleLog();
+        var console = new ConsoleProgress(verbose, log);
 
         if (noPasscode)
         {
@@ -905,7 +915,13 @@ public static class CliApplication
             gp5PlayGo = PlayGoProjectFactory.FromGp5(gp5, contentId);
         }
 
-        Console.WriteLine($"Building debug base/application package: {contentId}");
+        if (sharedLog is null)
+        {
+            log.Write("Build started");
+            log.Write($"Source: {fullSource}");
+            log.Write($"Output: {output}");
+        }
+        log.Write($"Building debug base/application package: {contentId}");
 
         // ---- 1. Collect inner files (exclude sce_sys outer-CNT entries). ----
         var innerFiles = new List<ProsperoInnerImageAssembler.InnerFile>();
@@ -941,10 +957,10 @@ public static class CliApplication
         var buildLog = new DebugPackageBuildLog
         {
             Progress = console,
-            Log = Console.WriteLine,
+            Log = log.Write,
             Finish = console.Finish,
         };
-        ProsperoDebugPackageBuilder.Build(innerFiles, new DebugPackageBuildOptions
+        DebugPackageBuildResult buildResult = ProsperoDebugPackageBuilder.Build(innerFiles, new DebugPackageBuildOptions
         {
             OutputPath = output,
             ContentId = contentId,
@@ -967,6 +983,8 @@ public static class CliApplication
             InjectRightSprx = injectRightSprx,
             Log = buildLog,
         });
+        if (sharedLog is null)
+            log.Write($"Build finished in {log.Elapsed}; output {buildResult.PackageLength:N0} bytes.");
         return 0;
     }
 
