@@ -18,6 +18,21 @@ public readonly record struct ProsperoBuildProgress(string Stage, long Done, lon
     /// </summary>
     public ProsperoBuildStage? StageId { get; init; }
 
+    /// <summary>
+    /// Bytes processed so far, when the stage can report a byte-accurate figure (inner image and
+    /// outer PFS). Zero when only <see cref="Done"/>/<see cref="Total"/> units are available.
+    /// </summary>
+    public long BytesDone { get; init; }
+
+    /// <summary>Total bytes for the stage, or 0 when a byte figure is not available.</summary>
+    public long BytesTotal { get; init; }
+
+    /// <summary>Path of the item currently being processed, when known.</summary>
+    public string? CurrentPath { get; init; }
+
     /// <summary>Completion ratio in [0,1]; 0 when <see cref="Total"/> is unknown.</summary>
     public double Fraction => Total > 0 ? (double)Done / Total : 0;
+
+    /// <summary>Byte completion ratio in [0,1]; 0 when <see cref="BytesTotal"/> is unknown.</summary>
+    public double ByteFraction => BytesTotal > 0 ? (double)BytesDone / BytesTotal : 0;
 }

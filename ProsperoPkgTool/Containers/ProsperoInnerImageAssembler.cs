@@ -281,6 +281,10 @@ public sealed class ProsperoInnerImageAssembler
         int sourceBlockIndex = 0;
         long pos = 0;
         int fileIndex = 0;
+        long payloadTotal = 0;
+        foreach (FileNode f in afidOrder)
+            payloadTotal += f.PayloadLength;
+        long payloadDone = 0;
 
         using FileStream? imageFs = outputPath is not null
             ? new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan)
@@ -330,7 +334,14 @@ public sealed class ProsperoInnerImageAssembler
             if (f.WholeBlockRaw)
                 pos = RoundUp(pos, BlockSize);
 
-            progress?.Report(new ProsperoBuildProgress("Inner image", ++fileIndex, afidOrder.Count) { StageId = ProsperoBuildStage.InnerImage });
+            payloadDone += f.PayloadLength;
+            progress?.Report(new ProsperoBuildProgress("Inner image", ++fileIndex, afidOrder.Count)
+            {
+                StageId = ProsperoBuildStage.InnerImage,
+                BytesDone = payloadDone,
+                BytesTotal = payloadTotal,
+                CurrentPath = f.FullPath,
+            });
         }
 
         long dataEndLogical = afidOrder.Count > 0
