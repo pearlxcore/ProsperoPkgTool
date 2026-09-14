@@ -34,10 +34,11 @@ internal static class KrakenLzEncoder
     private const int ChunkSize = KrakenEncoder.ChunkSize;
     private const int MaxBlockSize = KrakenEncoder.MaxBlockSize;
 
-    // Hash-chain match finder parameters.
-    private const int HashBits = 16;
+    // Hash-chain match finder parameters. A 4-byte hash and a wider table cut collisions so the
+    // chain holds more genuinely useful candidates; MaxChain bounds the per-position search cost.
+    private const int HashBits = 18;
     private const int HashSize = 1 << HashBits;
-    private const int MaxChain = 48;
+    private const int MaxChain = 128;
 
     // Per-thread scratch reused across blocks. A 64K-entry head table and an n-entry chain array were
     // allocated for every 128/256 KiB block, which dominated large builds' allocation/GC. The finder
@@ -215,7 +216,7 @@ internal static class KrakenLzEncoder
     private static void EnsureInserted(byte[] data, int[] head, int[] prev, ref int nextInsert, int upto)
     {
         int n = data.Length;
-        while (nextInsert < upto && nextInsert + 2 < n)
+        while (nextInsert < upto && nextInsert + 3 < n)
         {
             int h = Hash(data, nextInsert);
             prev[nextInsert] = head[h];
@@ -228,7 +229,7 @@ internal static class KrakenLzEncoder
 
     private static int Hash(byte[] data, int p)
     {
-        uint v = (uint)(data[p] | (data[p + 1] << 8) | (data[p + 2] << 16));
+        uint v = data[p] | ((uint)data[p + 1] << 8) | ((uint)data[p + 2] << 16) | ((uint)data[p + 3] << 24);
         return (int)((v * 2654435761u) >> (32 - HashBits));
     }
 

@@ -43,8 +43,8 @@ public sealed class ProsperoInsufficientSpaceException : IOException
 
 /// <summary>
 /// Estimates the peak disk a package build needs and checks it against free space. The file-backed
-/// pipeline holds several full-size artifacts at once — the inner image, the outer PFS, the CNT
-/// (which re-copies the whole outer image), and the output FIH — so the peak is roughly four times
+/// pipeline builds the inner image into the temp workspace and writes the outer PFS directly into the
+/// final package (the CNT is metadata-only), so there is no full-image copy: the peak is roughly twice
 /// the image size when the temp workspace and the output share a volume.
 /// </summary>
 public static class DiskSpaceGuard
@@ -66,23 +66,26 @@ public static class DiskSpaceGuard
         if (rawPayloadBytes < 0)
             rawPayloadBytes = 0;
 
-        // Conservative: the raw payload is the worst case for the inner image (compression only shrinks).
+        // Peak model for the current (no-copy) pipeline: the inner image is built into the temp
+        // workspace, and the outer PFS is written directly into the final package. The inner image can
+        // be as large as the raw payload (compression only shrinks it), and the package is about the
+        // same size again, so the peak is ~2x the payload on a shared volume. This deliberately does
+        // not assume any compression ratio, so it never blocks a build that could fit.
         long inner = rawPayloadBytes + Math.Max(16 * Megabyte, rawPayloadBytes / 100);
         long outer = AlignUp(inner, ProsperoOuterPfsBuilder.BlockSize) + 32 * Megabyte;
-        long cnt = outer + 16 * Megabyte;                                   // CNT prefix + a full outer copy
-        long fih = ProsperoFihBuilder.HeaderRegionSize + outer + 16 * Megabyte;
-        long tempBytes = inner + outer + cnt + 64 * Megabyte;               // + naps layout and slack
+        long output = ProsperoFihBuilder.HeaderRegionSize + outer + 64 * Megabyte; // + CNT metadata + SI
+        long temp = inner + 64 * Megabyte;                                        // inner image + naps layout + slack
 
         string tempRoot = RootOf(tempDirectory ?? Path.GetTempPath());
         string outputRoot = RootOf(outputPath);
 
         if (string.Equals(tempRoot, outputRoot, StringComparison.OrdinalIgnoreCase))
-            return [new SpaceRequirement(tempRoot, tempBytes + fih, "temp workspace + output")];
+            return [new SpaceRequirement(tempRoot, temp + output, "temp workspace + output")];
 
         return
         [
-            new SpaceRequirement(tempRoot, tempBytes, "temp workspace"),
-            new SpaceRequirement(outputRoot, fih, "output package"),
+            new SpaceRequirement(tempRoot, temp, "temp workspace"),
+            new SpaceRequirement(outputRoot, output, "output package"),
         ];
     }
 
