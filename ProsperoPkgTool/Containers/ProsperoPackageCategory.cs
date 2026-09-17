@@ -9,6 +9,8 @@ public enum ProsperoPackageCategory
     BaseGame,
     Application = BaseGame,
     UpdatePatch,
+    /// <summary>Additional content / DLC (content type <c>0x21</c>), whether it carries data or is a no-data unlock.</summary>
+    Dlc,
     DlcData,
     DlcNoData,
     OtherKnown,
@@ -34,13 +36,18 @@ public static class ProsperoPackageCategories
 {
     /// <summary>
     /// 0x20 is independently observed in retained prospero-pub-cmd base/debug and retail
-    /// package artifacts as PS5 game/application data. Other values remain deliberately raw
-    /// until an oracle establishes their full package semantics.
+    /// package artifacts as PS5 game/application data. 0x21 is the additional-content (DLC) bucket:
+    /// observed on debug entitlement packages whose content id carries a DLC/add-on suffix and whose
+    /// inner mount holds only the <c>sce_sys</c> tree (no payload). It is classified by hypothesis,
+    /// not an oracle, so it is not treated as <c>PubCmdConfirmed</c>. Other values remain deliberately
+    /// raw until an oracle establishes their full package semantics.
     /// </summary>
     public static ProsperoPackageCategoryInfo Classify(uint contentType) => contentType switch
     {
         0x20 => new(ProsperoPackageCategory.BaseGame, contentType,
             PackageCategoryEvidence.PubCmdConfirmed, "PS5 game/application data"),
+        0x21 => new(ProsperoPackageCategory.Dlc, contentType,
+            PackageCategoryEvidence.Hypothesis, "PS5 additional content (DLC)"),
         _ => new(ProsperoPackageCategory.Unknown, contentType,
             PackageCategoryEvidence.Unknown, "No clean-room category mapping is verified"),
     };

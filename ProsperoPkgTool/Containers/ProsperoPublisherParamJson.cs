@@ -164,6 +164,92 @@ public static class ProsperoPublisherParamJson
     }
 
     /// <summary>
+    /// Rewrites only the display title of a source <c>param.json</c>: every
+    /// <c>localizedParameters.*.titleName</c> plus the top-level <c>titleName</c> when present.
+    /// Used for an explicit title override; the builder otherwise packages the source title verbatim.
+    /// </summary>
+    public static byte[] ApplyTitleOverride(ReadOnlySpan<byte> sourceParamJson, string titleName)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(titleName);
+        JsonObject root = ParseObject(sourceParamJson);
+
+        if (root["titleName"] is not null)
+            root["titleName"] = titleName;
+
+        if (root["localizedParameters"] is JsonObject locals)
+        {
+            foreach (KeyValuePair<string, JsonNode?> pair in locals.ToList())
+            {
+                if (pair.Value is JsonObject entry && entry["titleName"] is not null)
+                    entry["titleName"] = titleName;
+            }
+            locals["default"] = SetTitle(locals["default"] as JsonObject, titleName);
+            locals["en-US"] = SetTitle(locals["en-US"] as JsonObject, titleName);
+        }
+        else
+        {
+            root["localizedParameters"] = new JsonObject
+            {
+                ["default"] = new JsonObject { ["titleName"] = titleName },
+                ["defaultLanguage"] = "en-US",
+                ["en-US"] = new JsonObject { ["titleName"] = titleName },
+            };
+        }
+
+        return Serialize(root);
+
+        static JsonObject SetTitle(JsonObject? entry, string title)
+        {
+            entry ??= new JsonObject();
+            entry["titleName"] = title;
+            return entry;
+        }
+    }
+
+    /// <summary>
+    /// Rewrites only the title id of a source <c>param.json</c>. When the content id has the standard
+    /// 36-character shape its embedded 9-character title segment is rewritten too, so the two stay
+    /// consistent (the console derives the title id from the content id).
+    /// </summary>
+    public static byte[] ApplyTitleIdOverride(ReadOnlySpan<byte> sourceParamJson, string titleId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(titleId);
+        JsonObject root = ParseObject(sourceParamJson);
+
+        root["titleId"] = titleId;
+        if (titleId.Length == 9 && root["contentId"]?.GetValue<string>() is { Length: 36 } contentId)
+            root["contentId"] = string.Concat(contentId.AsSpan(0, 7), titleId, contentId.AsSpan(16));
+
+        return Serialize(root);
+    }
+
+    private static JsonObject ParseObject(ReadOnlySpan<byte> source)
+    {
+        JsonNode node;
+        try
+        {
+            node = JsonNode.Parse(source) ?? throw new InvalidDataException("sce_sys/param.json is empty.");
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidDataException("sce_sys/param.json is not valid JSON.", ex);
+        }
+        return node as JsonObject ?? throw new InvalidDataException("sce_sys/param.json must contain a JSON object.");
+    }
+
+    private static byte[] Serialize(JsonObject root)
+    {
+        string text = SortOrdinal(root).ToJsonString(new JsonSerializerOptions
+        {
+            WriteIndented = true,
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        });
+        text = text.Replace("\r\n", "\n", StringComparison.Ordinal)
+                   .Replace("\n", "\r\n", StringComparison.Ordinal) + "\r\n";
+        return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false).GetBytes(text);
+    }
+
+    /// <summary>
     /// Resolves the SDK version from a source <c>eboot.bin</c>: an ELF <c>.sceversion</c> section, or
     /// the trailer appended to a publisher fake-SELF. Returns zero when nothing can be read.
     /// </summary>

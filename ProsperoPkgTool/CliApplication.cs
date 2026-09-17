@@ -49,7 +49,7 @@ public static class CliApplication
                 "img-file-list" or "img_file_list" => RunInnerImageFileList(commandArgs),
                 "img-extract" or "img_extract" => RunInnerImageExtract(commandArgs),
                 "img-verify" or "img_verify" => RunInnerImageVerify(commandArgs),
-                "img-create" or "img_create" => RunInnerImageCreate(commandArgs),
+                "img-create" or "img_create" => RunInnerImageCreate(commandArgs, sharedLog: null, cancellationToken),
                 "convert" or "backup-convert" or "backup_convert" => RunBackupConvert(commandArgs),
                 "compare" => RunCompare(commandArgs),
                 "fself" or "fake-sign" => RunFakeSign(commandArgs),
@@ -467,7 +467,7 @@ public static class CliApplication
         // Multi-GB finalized-debug PFS images cannot be materialized as one byte[]; use the
         // file-backed reader.
         bool large = structural.Kind == ProsperoPackageKind.FinalizedDebug &&
-            structural.Fih is { } fihLarge && fihLarge.PfsSize > (1L << 31);
+            ProsperoPackageContent.RequiresFileBacked(package, noPasscode ? null : passcode);
         if (large)
         {
             try
@@ -516,6 +516,14 @@ public static class CliApplication
         IReadOnlyList<ProsperoInnerPfsReader.Entry> entries)
     {
         NapsLayoutDocument doc = ProsperoNapsLayout.Parse(naps);
+        if (blocks is NapsBlockPlan plan)
+        {
+            Console.WriteLine($"NAPS dialect: {plan.Dialect}");
+            foreach (string diagnostic in plan.Diagnostics)
+                Console.WriteLine($"NAPS probe: {diagnostic}");
+        }
+        Console.WriteLine($"Block kinds: stored {blocks.Count(b => !b.IsKraken && !b.IsZeroHole && !b.IsAlias)}, " +
+            $"Kraken {blocks.Count(b => b.IsKraken)}, zero-fill {blocks.Count(b => b.IsZeroHole)}, alias {blocks.Count(b => b.IsAlias)}");
         long totalCompressed = 0, totalUncompressed = 0;
         int rawBlocks = 0, krakenBlocks = 0, dedupBlocks = 0;
         foreach (ProsperoPs5InnerImageReader.InnerBlock b in blocks)
@@ -569,6 +577,8 @@ public static class CliApplication
         int krakenThreads = 0;
         ulong? sdkVersionOverride = null;
         string? drmTypeOverride = null;
+        string? titleOverride = null;
+        string? titleIdOverride = null;
         bool sweepTemp = true;
         int staleHours = 12;
         string? tempDir = null;
@@ -629,6 +639,12 @@ public static class CliApplication
                 case "--use-embedded-right-sprx":
                     useEmbeddedRightSprx = true;
                     break;
+                case "--title" when i + 1 < args.Length:
+                    titleOverride = args[++i];
+                    break;
+                case "--title-id" when i + 1 < args.Length:
+                    titleIdOverride = args[++i];
+                    break;
                 case "--no_passcode":
                     noPasscode = true;
                     break;
@@ -641,7 +657,7 @@ public static class CliApplication
         }
         if (backup is null || output is null)
         {
-            Console.Error.WriteLine("Usage: ProsperoPkgTool convert <backup-folder> --out <package.pkg> [--decrypted <subfolder>] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--compression stored|kraken] [--kraken-level -4..9] [--kraken-threads <n|0=auto>] [--sdk <major|0x-id>] [--drm-type <token>] [--no-temp-sweep] [--stale-hours <n>] [--temp <dir>] [--staging <folder>] [--keep-staging] [--use-embedded-right-sprx] [--verbose]");
+            Console.Error.WriteLine("Usage: ProsperoPkgTool convert <backup-folder> --out <package.pkg> [--decrypted <subfolder>] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--compression stored|kraken] [--kraken-level -4..9] [--kraken-threads <n|0=auto>] [--sdk <major|0x-id>] [--drm-type <token>] [--title <name>] [--title-id <id>] [--no-temp-sweep] [--stale-hours <n>] [--temp <dir>] [--staging <folder>] [--keep-staging] [--use-embedded-right-sprx] [--verbose]");
             return 2;
         }
 
@@ -660,6 +676,7 @@ public static class CliApplication
             StagingFolder = staging ?? "",
             KeepStaging = keepStaging,
             UseEmbeddedRightSprx = useEmbeddedRightSprx,
+            Verbose = verbose,
         };
 
         var log = new ProsperoConsoleLog();
@@ -697,6 +714,16 @@ public static class CliApplication
                 buildArgs.Add("--drm-type");
                 buildArgs.Add(drmTypeOverride);
             }
+            if (!string.IsNullOrWhiteSpace(titleOverride))
+            {
+                buildArgs.Add("--title");
+                buildArgs.Add(titleOverride!);
+            }
+            if (!string.IsNullOrWhiteSpace(titleIdOverride))
+            {
+                buildArgs.Add("--title-id");
+                buildArgs.Add(titleIdOverride!);
+            }
             if (!sweepTemp) buildArgs.Add("--no-temp-sweep");
             if (staleHours != 12)
             {
@@ -733,7 +760,7 @@ public static class CliApplication
             log.Write($"Staging folder: {result.StagingFolder}");
     }
 
-    private static int RunInnerImageCreate(string[] args, ProsperoConsoleLog? sharedLog = null)
+    private static int RunInnerImageCreate(string[] args, ProsperoConsoleLog? sharedLog = null, CancellationToken cancellationToken = default)
     {
         string? source = null;
         string? output = null;
@@ -753,6 +780,8 @@ public static class CliApplication
         byte[]? outerSeed = null;
         ulong? sdkVersionOverride = null;
         string? drmTypeOverride = null;
+        string? titleOverride = null;
+        string? titleIdOverride = null;
         bool sweepTemp = true;
         int staleHours = 12;
         int playGoChunks = 1;
@@ -814,6 +843,12 @@ public static class CliApplication
                 case "--playgo-chunks" when i + 1 < args.Length:
                     playGoChunks = ParseIntOption("--playgo-chunks", args[++i]);
                     break;
+                case "--title" when i + 1 < args.Length:
+                    titleOverride = args[++i];
+                    break;
+                case "--title-id" when i + 1 < args.Length:
+                    titleIdOverride = args[++i];
+                    break;
                 case "--no_passcode":
                     noPasscode = true;
                     break;
@@ -832,7 +867,7 @@ public static class CliApplication
         }
         if (source is null || output is null)
         {
-            Console.Error.WriteLine("Usage: ProsperoPkgTool img_create <source-folder | project.gp5> --out <package.pkg> [--type base] [--compression stored|kraken] [--kraken-level -4..9] [--kraken-threads <n|0=auto>] [--seed <32-hex>] [--sdk <major|0x-id>] [--drm-type <token>] [--no-temp-sweep] [--stale-hours <n>] [--temp <dir>] [--playgo-chunks <n>] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--no_fself] [--no_right_sprx] [--verbose]");
+            Console.Error.WriteLine("Usage: ProsperoPkgTool img_create <source-folder | project.gp5> --out <package.pkg> [--type base] [--compression stored|kraken] [--kraken-level -4..9] [--kraken-threads <n|0=auto>] [--seed <32-hex>] [--sdk <major|0x-id>] [--drm-type <token>] [--no-temp-sweep] [--stale-hours <n>] [--temp <dir>] [--playgo-chunks <n>] [--title <name>] [--title-id <id>] [--content-id <id>] [--passcode <32 chars>|--no_passcode] [--no_fself] [--no_right_sprx] [--verbose]");
             return 2;
         }
 
@@ -976,6 +1011,8 @@ public static class CliApplication
             DeterministicEntryKeys = outerSeed is not null,
             SdkVersionOverride = sdkVersionOverride,
             DrmTypeOverride = drmTypeOverride,
+            TitleOverride = titleOverride,
+            TitleIdOverride = titleIdOverride,
             SweepStaleTempWorkspaces = sweepTemp,
             StaleWorkspaceHours = staleHours,
             TempDirectory = tempDir,
@@ -985,6 +1022,7 @@ public static class CliApplication
             FakeSignModules = fakeSignModules,
             InjectRightSprx = injectRightSprx,
             Log = buildLog,
+            CancellationToken = cancellationToken,
         });
         if (sharedLog is null)
             log.Write($"Build finished in {log.Elapsed}; output {buildResult.PackageLength:N0} bytes.");
@@ -1156,8 +1194,8 @@ public static class CliApplication
 
         var console = new ConsoleProgress(verbose);
 
-        if (ProsperoPackageReader.Read(package) is
-            { Kind: ProsperoPackageKind.FinalizedDebug, Fih: { } fihLarge } && fihLarge.PfsSize > (1L << 31))
+        if (ProsperoPackageReader.Read(package).Kind == ProsperoPackageKind.FinalizedDebug &&
+            ProsperoPackageContent.RequiresFileBacked(package, noPasscode ? null : passcode))
             return RunInnerImageExtractFileBacked(package, selection, output, noPasscode ? null : passcode, mountMode, console);
 
         ProsperoDecodedPackage decoded = ProsperoPackageContent.Read(package, noPasscode ? null : passcode, referencePackage);
@@ -1286,7 +1324,7 @@ public static class CliApplication
         try
         {
             bool large = inspection.Kind == ProsperoPackageKind.FinalizedDebug &&
-                inspection.Fih is { } fihLarge && fihLarge.PfsSize > (1L << 31);
+                ProsperoPackageContent.RequiresFileBacked(package, passcode);
             string prefix = NormalizeInnerSelection(subtree);
             if (repairOffsets)
                 Console.Error.WriteLine("Note: reconstructing truncated 64-bit directory offsets for listing; file data offsets may remain truncated.");
@@ -1332,29 +1370,45 @@ public static class CliApplication
     {
         string? package = null, passcode = null, referencePackage = null;
         bool strict = false;
+        VerificationPolicy policy = VerificationPolicy.DebugPackage;
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--passcode" && i + 1 < args.Length) passcode = args[++i];
             else if (args[i] == "--ref_pkg_path" && i + 1 < args.Length) referencePackage = args[++i];
+            else if (args[i] == "--policy" && i + 1 < args.Length)
+            {
+                if (!Enum.TryParse(args[++i], ignoreCase: true, out policy))
+                {
+                    Console.Error.WriteLine("Unknown --policy. Use Structural, DebugPackage, BuildAcceptance or FullAvailableChecks.");
+                    return 2;
+                }
+            }
             else if (args[i] == "--no_passcode") { }
             else if (args[i] == "--strict") strict = true;
             else if (args[i].StartsWith("--", StringComparison.Ordinal)) return UnknownOption(args[i]);
             else package ??= args[i];
         }
-        if (package is null) { Console.Error.WriteLine("Usage: ProsperoPkgTool img_verify [--ref_pkg_path <reference.pkg>] [--passcode <passcode>|--no_passcode] [--strict] <package>"); return 2; }
-        ProsperoPackageVerificationReport report = ProsperoPackageVerifier.Verify(package, passcode, referencePackage);
+        if (package is null)
+        {
+            Console.Error.WriteLine("Usage: ProsperoPkgTool img_verify [--ref_pkg_path <reference.pkg>] [--passcode <passcode>|--no_passcode] [--policy <Structural|DebugPackage|BuildAcceptance|FullAvailableChecks>] [--strict] <package>");
+            return 2;
+        }
+        ProsperoPackageVerificationReport report = ProsperoPackageVerifier.Verify(package, passcode, referencePackage, policy);
         foreach (VerificationCheck check in report.Checks)
-            Console.WriteLine($"{check.State.ToString().ToUpperInvariant(),-11} {check.Name}: {check.Detail}");
+            Console.WriteLine($"{(check.Required ? "*" : " ")}{check.State.ToString().ToUpperInvariant(),-11} {check.Name}: {check.Detail}");
         int pass = report.Checks.Count(c => c.State == VerificationState.Pass);
         int fail = report.Checks.Count(c => c.State == VerificationState.Fail);
         int unavailable = report.Checks.Count(c => c.State == VerificationState.Unavailable);
+        int unsupported = report.Checks.Count(c => c.State == VerificationState.Unsupported);
+        int error = report.Checks.Count(c => c.State == VerificationState.Error);
         int notPresent = report.Checks.Count(c => c.State == VerificationState.NotPresent);
-        Console.WriteLine($"Summary: {pass} pass, {fail} fail, {unavailable} unavailable, {notPresent} not present.");
-        if (unavailable > 0)
-            Console.WriteLine("Verification is incomplete: unavailable checks were not independently proven (use --strict to fail on this).");
+        Console.WriteLine($"Summary ({policy}): {pass} pass, {fail} fail, {error} error, {unavailable} unavailable, {unsupported} unsupported, {notPresent} not present.");
+        Console.WriteLine($"Outcome: {report.Outcome.ToString().ToUpperInvariant()}.");
+        if (report.Outcome == VerificationOutcome.Incomplete)
+            Console.WriteLine("Verification is incomplete: not all required checks were performed (use --strict to fail on this).");
         if (report.HasFailure)
             return 4;
-        return strict && unavailable > 0 ? 6 : 0;
+        return strict && report.Outcome == VerificationOutcome.Incomplete ? 6 : 0;
     }
 
     private static void PrintParamSummary(string packagePath, ProsperoPackageInspection package)
@@ -1366,8 +1420,23 @@ public static class CliApplication
             using JsonDocument doc = JsonDocument.Parse(ProsperoPackageContent.ReadCntEntry(packagePath, package, param));
             JsonElement root = doc.RootElement;
             string Value(string property) => root.TryGetProperty(property, out JsonElement item) && item.ValueKind == JsonValueKind.String ? item.GetString() ?? "(unavailable)" : "(unavailable)";
+            // The display title usually lives under localizedParameters, not at the top level.
+            string TitleName()
+            {
+                string top = Value("titleName");
+                if (top != "(unavailable)")
+                    return top;
+                if (root.TryGetProperty("localizedParameters", out JsonElement locals) && locals.ValueKind == JsonValueKind.Object)
+                {
+                    foreach (string key in new[] { "default", "en-US" })
+                        if (locals.TryGetProperty(key, out JsonElement entry) &&
+                            entry.TryGetProperty("titleName", out JsonElement name) && name.ValueKind == JsonValueKind.String)
+                            return name.GetString() ?? "(unavailable)";
+                }
+                return "(unavailable)";
+            }
             Console.WriteLine($"Title ID: {Value("titleId")}");
-            Console.WriteLine($"Title name: {Value("titleName")}");
+            Console.WriteLine($"Title name: {TitleName()}");
             Console.WriteLine($"Application/package version: {Value("contentVersion")}");
             Console.WriteLine("Master version / SDK version / required system software: unavailable");
         }
@@ -1570,7 +1639,8 @@ public static class CliApplication
         Console.WriteLine("                          Substitutes raw ELF modules from the decrypted subtree, fake-signs");
         Console.WriteLine("                          them, then reports module classification and launch-readiness");
         Console.WriteLine("                          [--decrypted <subfolder>] [--content-id <id>] [--passcode <32 chars>|--no_passcode]");
-        Console.WriteLine("                          [--version NN.NN] [--compression stored|kraken] [--staging <folder>]");
+        Console.WriteLine("                          [--compression stored|kraken] [--drm-type <token>] [--title <name>]");
+        Console.WriteLine("                          [--title-id <id>] [--sdk <major|0x-id>] [--staging <folder>]");
         Console.WriteLine("                          [--keep-staging] [--use-embedded-right-sprx]");
         Console.WriteLine("Parity:");
         Console.WriteLine("  compare <reference.pkg> <candidate.pkg>  Field-by-field container diff (exit 1 on differences)");

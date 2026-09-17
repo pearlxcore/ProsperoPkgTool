@@ -16,8 +16,27 @@ The reader is verified byte for byte against a real Sony built debug package:
 - inner image parsing, so listing and extracting individual files works
 - building debug base and application packages with `img_create` (stored or Kraken)
 
-Packages built here verify and extract on PC. The reference engine and Sony's own tool
-can read them too.
+Packages built here verify and extract on PC against this project's own reader. Independent
+cross-implementation validation is **not** currently reproducible in-tree: the
+`tools/CrossValidate.ps1` oracle is being repaired against the current LibProsperoPkg API, and the
+retail cross-checks are opt-in. No PS5 hardware install or launch has been demonstrated.
+
+## Verification levels
+
+"Verified" is only used with its scope stated:
+
+- **Structurally parsed** — FIH/CNT/LIH/PFS envelopes and ranges are read and bounds-checked.
+- **Internally round-tripped** — bytes written by this project are read back by this project (internal
+  consistency, not independent proof).
+- **Fixture parity** — specific fields are byte-compared against a checked-in Sony-built debug package.
+- **Independently cross-validated** — a different implementation decodes the same artifact; requires the
+  repaired oracle harness and is not currently reproducible in-tree.
+- **Cryptographically verified** — RSA/ECDSA signature verification is not implemented.
+- **Hardware tested** — not performed; no PS5 install/launch evidence exists.
+
+`img_verify` reports each check as `PASS` / `FAIL` / `UNAVAILABLE` / `UNSUPPORTED` / `ERROR` and an
+overall `PASSED` / `FAILED` / `INCOMPLETE` outcome. A missing key is `UNAVAILABLE`; a decode, crypto, or
+I/O failure after the payload opens is `ERROR` (a failure), and is never softened to `UNAVAILABLE`.
 
 ## Build
 
@@ -33,7 +52,9 @@ The CLI lands in `ProsperoPkgTool\bin\Release\net10.0\ProsperoPkgTool.exe`.
 dotnet test .\ProsperoPkgTool.Tests\ProsperoPkgTool.Tests.csproj -c Release
 ```
 
-The suite covers read/write/verify round-trips, Sony-fixture parity, and reference cross-reads. Three
+The suite covers internal read/write/verify round-trips (internal consistency, not independent
+proof), Sony-fixture parity against a checked-in real package, and regression fixtures. Independent
+cross-implementation cross-reads require the repaired `tools/CrossValidate.ps1` oracle. Three
 tests are **opt-in** and skipped in a normal run because they need a locally supplied retail package
 (they are not repository fixtures):
 

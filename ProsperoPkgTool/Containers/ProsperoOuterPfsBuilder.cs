@@ -256,8 +256,9 @@ public static class ProsperoOuterPfsBuilder
     /// </summary>
     public static OuterPfsBuildResult BuildPlaintext(
         IReadOnlyList<OuterPfsFile> files, OuterPfsBuildParameters parameters,
-        IProgress<ProsperoBuildProgress>? progress = null)
+        IProgress<ProsperoBuildProgress>? progress = null, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         ArgumentNullException.ThrowIfNull(files);
         ArgumentNullException.ThrowIfNull(parameters);
         if (files.Count == 0)
@@ -269,6 +270,7 @@ public static class ProsperoOuterPfsBuilder
         var fileBlockCount = new int[files.Count];
         for (int i = 0; i < files.Count; i++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             OuterPfsFile f = files[i];
             ArgumentNullException.ThrowIfNull(f);
             int blocks = Math.Max(1, (f.Data.Length + BlockSize - 1) / BlockSize);
@@ -358,12 +360,13 @@ public static class ProsperoOuterPfsBuilder
     /// <summary>Encrypt (or decrypt) the built image in place using the given XTS key pair.</summary>
     public static void Encrypt(
         OuterPfsBuildResult build, ReadOnlySpan<byte> tweakKey, ReadOnlySpan<byte> dataKey, bool encrypt = true,
-        IProgress<ProsperoBuildProgress>? progress = null)
+        IProgress<ProsperoBuildProgress>? progress = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(build);
         using var xts = new AesXts(dataKey, tweakKey);
         for (int i = 0; i < build.BlockCount; i++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             OuterBlockKind kind = build.BlockKinds[i];
             if (kind == OuterBlockKind.Plaintext)
             {
@@ -411,8 +414,10 @@ public static class ProsperoOuterPfsBuilder
     public static OuterPfsFileBuildResult BuildForPackageToFile(
         IReadOnlyList<OuterPfsFileSource> files, OuterPfsBuildParameters parameters,
         string outputPath, bool encryptOutput, ReadOnlySpan<byte> tweakKey, ReadOnlySpan<byte> dataKey,
-        IProgress<ProsperoBuildProgress>? progress = null, long outputOffset = 0)
+        IProgress<ProsperoBuildProgress>? progress = null, long outputOffset = 0,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         ArgumentNullException.ThrowIfNull(files);
         ArgumentNullException.ThrowIfNull(parameters);
         if (files.Count == 0)
@@ -481,7 +486,7 @@ public static class ProsperoOuterPfsBuilder
         {
             outFs.SetLength(checked(outputOffset + imageLength));
             WriteDataBlocks(outFs, files, fileFirstBlock, fileBlockCount, dataBlockTotal,
-                encryptOutput, tweakKey, dataKey, parallelism, imageDigests, outputOffset, progress);
+                encryptOutput, tweakKey, dataKey, parallelism, imageDigests, outputOffset, progress, cancellationToken);
 
             // ---- 3. Structural metadata blocks (need the data digests captured above). ----
             byte[] superRootBlock = new byte[BlockSize];
@@ -588,7 +593,8 @@ public static class ProsperoOuterPfsBuilder
         FileStream outFs, IReadOnlyList<OuterPfsFileSource> files,
         int[] fileFirstBlock, int[] fileBlockCount, int dataBlockTotal,
         bool encryptOutput, ReadOnlySpan<byte> tweakKey, ReadOnlySpan<byte> dataKey,
-        int parallelism, byte[] imageDigests, long outputOffset, IProgress<ProsperoBuildProgress>? progress)
+        int parallelism, byte[] imageDigests, long outputOffset, IProgress<ProsperoBuildProgress>? progress,
+        CancellationToken cancellationToken = default)
     {
         int processedBlocks = 0;
         if (parallelism <= 1 || !encryptOutput)
@@ -596,6 +602,7 @@ public static class ProsperoOuterPfsBuilder
             byte[] block = new byte[BlockSize];
             for (int i = 0; i < files.Count; i++)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 OuterBlockKind kind = files[i].Signed ? OuterBlockKind.Signed : OuterBlockKind.Data;
                 outFs.Position = outputOffset + (long)fileFirstBlock[i] * BlockSize;
                 using var src = new FileStream(files[i].Path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
@@ -630,6 +637,7 @@ public static class ProsperoOuterPfsBuilder
         var options = new ParallelOptions { MaxDegreeOfParallelism = parallelism };
         for (int i = 0; i < files.Count; i++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             OuterBlockKind kind = files[i].Signed ? OuterBlockKind.Signed : OuterBlockKind.Data;
             using var src = new FileStream(files[i].Path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
             for (int start = 0; start < fileBlockCount[i]; start += window)

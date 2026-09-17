@@ -164,8 +164,9 @@ public sealed class ProsperoInnerImageAssembler
     /// <param name="krakenLevel">Kraken level recorded in the compressed metadata header (default 7).</param>
     /// <param name="krakenThreads">Blocks encoded concurrently; 0 selects the processor count.</param>
     public InnerImageResult Build(IReadOnlyList<InnerFile> files, ProsperoInnerCompressionMode compressionMode = ProsperoInnerCompressionMode.Stored,
-        IProgress<ProsperoBuildProgress>? progress = null, int krakenLevel = KrakenTuning.DefaultLevel, int krakenThreads = 0)
-        => BuildCore(files, compressionMode, null, progress, krakenLevel, krakenThreads);
+        IProgress<ProsperoBuildProgress>? progress = null, int krakenLevel = KrakenTuning.DefaultLevel, int krakenThreads = 0,
+        CancellationToken cancellationToken = default)
+        => BuildCore(files, compressionMode, null, progress, krakenLevel, krakenThreads, cancellationToken);
 
     /// <summary>
     /// File-backed counterpart: the physical <c>pfs_image.dat</c> is written directly to
@@ -173,17 +174,20 @@ public sealed class ProsperoInnerImageAssembler
     /// may exceed the in-memory array limit. All geometry/metadata remains available in the result.
     /// </summary>
     public InnerImageResult BuildToFile(IReadOnlyList<InnerFile> files, string outputPath, ProsperoInnerCompressionMode compressionMode = ProsperoInnerCompressionMode.Stored,
-        IProgress<ProsperoBuildProgress>? progress = null, int krakenLevel = KrakenTuning.DefaultLevel, int krakenThreads = 0)
+        IProgress<ProsperoBuildProgress>? progress = null, int krakenLevel = KrakenTuning.DefaultLevel, int krakenThreads = 0,
+        CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
         string full = Path.GetFullPath(outputPath);
         Directory.CreateDirectory(Path.GetDirectoryName(full) ?? Directory.GetCurrentDirectory());
-        return BuildCore(files, compressionMode, full, progress, krakenLevel, krakenThreads);
+        return BuildCore(files, compressionMode, full, progress, krakenLevel, krakenThreads, cancellationToken);
     }
 
     private InnerImageResult BuildCore(IReadOnlyList<InnerFile> files, ProsperoInnerCompressionMode compressionMode, string? outputPath,
-        IProgress<ProsperoBuildProgress>? progress = null, int krakenLevel = KrakenTuning.DefaultLevel, int krakenThreads = 0)
+        IProgress<ProsperoBuildProgress>? progress = null, int krakenLevel = KrakenTuning.DefaultLevel, int krakenThreads = 0,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         ArgumentNullException.ThrowIfNull(files);
         if (files.Count == 0)
             throw new ArgumentException("At least one inner file is required.", nameof(files));
@@ -293,6 +297,7 @@ public sealed class ProsperoInnerImageAssembler
 
         foreach (FileNode f in afidOrder)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             // Logical offsets and afids were resolved by the sparse slot assignment above.
             f.StoreRaw = compressionMode == ProsperoInnerCompressionMode.Stored || f.WholeBlockRaw;
 
@@ -425,7 +430,8 @@ public sealed class ProsperoInnerImageAssembler
         }
         else
         {
-            (compressedMeta, metaBlocks) = ProsperoPfsv3Writer.WriteCompressed(metaPlain, level: krakenLevel);
+            cancellationToken.ThrowIfCancellationRequested();
+            (compressedMeta, metaBlocks) = ProsperoPfsv3Writer.WriteCompressed(metaPlain, level: krakenLevel, cancellationToken: cancellationToken);
         }
         pos = RoundUp(pos, BlockSize);
         long metadataOnDisk = pos;

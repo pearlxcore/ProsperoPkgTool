@@ -55,6 +55,12 @@ public sealed class ProsperoBackupConversionOptions
     /// backup's module is substituted and fake-signed like every other executable).
     /// </summary>
     public bool UseEmbeddedRightSprx { get; set; }
+
+    /// <summary>
+    /// When true every staged file is logged by name. Useful to confirm a long staging copy is making
+    /// progress; off by default to avoid thousands of lines.
+    /// </summary>
+    public bool Verbose { get; set; }
 }
 
 /// <summary>
@@ -139,6 +145,10 @@ public static class ProsperoBackupConverter
     private const uint SelfMagic = ProsperoSelfBuilder.Magic;
     private const ulong AuthorityMask = 0xFF00000000000000UL;
     private const ulong FakeAuthorityPrefix = 0x3100000000000000UL;
+
+    // A 2 MiB window is larger than any SELF header plus segment table, so the authority-id probe
+    // never needs to read a whole (potentially multi-GB) module into memory.
+    private const int HeaderWindow = 0x200000;
 
     /// <summary>
     /// Assembles the merged source tree from the backup and classifies its modules. The caller owns
@@ -316,11 +326,32 @@ public static class ProsperoBackupConverter
         string decryptedFull = hasDecrypted ? Path.GetFullPath(decryptedRoot) : "";
         string[] files = Directory.GetFiles(backup, "*", SearchOption.AllDirectories);
 
+        // Pre-compute byte totals so staging reports a byte-accurate progress bar: a file-count-only
+        // figure leaves the bar stuck for minutes while a few multi-GB files copy over SMB.
+        var sizes = new long[files.Length];
+        long totalBytes = 0;
+        for (int i = 0; i < files.Length; i++)
+        {
+            try { sizes[i] = new FileInfo(files[i]).Length; }
+            catch (IOException) { sizes[i] = 0; }
+            totalBytes += sizes[i];
+        }
+
+        long bytesDone = 0;
         for (int i = 0; i < files.Length; i++)
         {
             StageFile(files[i]);
-            progress?.Report(new ProsperoBuildProgress("Staging", i + 1, files.Length) { StageId = ProsperoBuildStage.Staging });
+            bytesDone += sizes[i];
+            progress?.Report(new ProsperoBuildProgress("Staging", i + 1, files.Length)
+            {
+                StageId = ProsperoBuildStage.Staging,
+                BytesDone = bytesDone,
+                BytesTotal = totalBytes,
+                CurrentPath = Path.GetRelativePath(backup, files[i]),
+            });
         }
+
+        log($"Staging complete: {files.Length:N0} files, {totalBytes / 1073741824.0:N2} GiB.");
 
         void StageFile(string file)
         {
@@ -339,6 +370,9 @@ public static class ProsperoBackupConverter
                 log("Dropping the backup right.sprx; the embedded debug module will be used.");
                 return;
             }
+
+            if (options.Verbose)
+                log($"  staging {relNorm}");
 
             string target = Path.Combine(staging, rel);
             Directory.CreateDirectory(Path.GetDirectoryName(target)!);
@@ -413,7 +447,11 @@ public static class ProsperoBackupConverter
     {
         try
         {
-            byte[] bytes = File.ReadAllBytes(path);
+            using FileStream fs = File.OpenRead(path);
+            int length = (int)Math.Min(HeaderWindow, fs.Length);
+            if (length <= 0) return false;
+            byte[] bytes = new byte[length];
+            fs.ReadAtLeast(bytes, length, throwOnEndOfStream: false);
             return ProsperoSelfReader.TryReadAuthorityId(bytes, out ulong authorityId) &&
                 (authorityId & AuthorityMask) == FakeAuthorityPrefix;
         }

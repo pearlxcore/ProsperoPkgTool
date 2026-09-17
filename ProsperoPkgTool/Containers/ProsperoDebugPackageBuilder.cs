@@ -29,6 +29,12 @@ public sealed class DebugPackageBuildOptions
     /// <summary>Destination package path.</summary>
     public required string OutputPath { get; init; }
 
+    /// <summary>
+    /// Optional cancellation token. It is honoured at stage, per-file, per-block and per-copy
+    /// boundaries; cancelling aborts the build and removes a partial output file.
+    /// </summary>
+    public CancellationToken CancellationToken { get; init; }
+
     /// <summary>36-character content id.</summary>
     public required string ContentId { get; init; }
 
@@ -128,6 +134,12 @@ public sealed class DebugPackageBuildOptions
     /// </summary>
     public string? DrmTypeOverride { get; init; }
 
+    /// <summary>Optional display-title override written into param.json (all localized titleName fields).</summary>
+    public string? TitleOverride { get; init; }
+
+    /// <summary>Optional title-id override written into param.json (also fixes the content id's title segment).</summary>
+    public string? TitleIdOverride { get; init; }
+
     /// <summary>Console/progress surface. Optional.</summary>
     public DebugPackageBuildLog? Log { get; init; }
 }
@@ -147,8 +159,11 @@ public static class ProsperoDebugPackageBuilder
 {
     /// <summary>Build the package described by <paramref name="options"/>.</summary>
     public static DebugPackageBuildResult Build(
-        IReadOnlyList<ProsperoInnerImageAssembler.InnerFile> files, DebugPackageBuildOptions options)
+        IReadOnlyList<ProsperoInnerImageAssembler.InnerFile> files, DebugPackageBuildOptions options,
+        CancellationToken cancellationToken = default)
     {
+        CancellationToken token = cancellationToken.CanBeCanceled ? cancellationToken : options.CancellationToken;
+        token.ThrowIfCancellationRequested();
         ArgumentNullException.ThrowIfNull(files);
         ArgumentNullException.ThrowIfNull(options);
         if (files.Count == 0)
@@ -178,7 +193,10 @@ public static class ProsperoDebugPackageBuilder
         {
             long rawPayload = 0;
             foreach (ProsperoInnerImageAssembler.InnerFile file in files)
+            {
+                token.ThrowIfCancellationRequested();
                 rawPayload += file.PayloadLength;
+            }
             DiskSpaceReport space = DiskSpaceGuard.Check(DiskSpaceGuard.Estimate(rawPayload, options.OutputPath, options.TempDirectory));
             if (space.Status == DiskSpaceStatus.Insufficient)
                 throw new ProsperoInsufficientSpaceException(
@@ -205,6 +223,18 @@ public static class ProsperoDebugPackageBuilder
         {
             paramJson = ProsperoPublisherParamJson.ApplyDrmType(paramJson, options.DrmTypeOverride);
             console.Log($"  DRM type override: {options.DrmTypeOverride}");
+        }
+
+        // Title / title-id overrides (opt-in): rewrite only those fields of the source publisher document.
+        if (!string.IsNullOrWhiteSpace(options.TitleIdOverride))
+        {
+            paramJson = ProsperoPublisherParamJson.ApplyTitleIdOverride(paramJson, options.TitleIdOverride);
+            console.Log($"  Title ID override: {options.TitleIdOverride}");
+        }
+        if (!string.IsNullOrWhiteSpace(options.TitleOverride))
+        {
+            paramJson = ProsperoPublisherParamJson.ApplyTitleOverride(paramJson, options.TitleOverride);
+            console.Log($"  Title override: {options.TitleOverride}");
         }
 
         var innerFiles = new List<ProsperoInnerImageAssembler.InnerFile>(files);
@@ -267,10 +297,13 @@ public static class ProsperoDebugPackageBuilder
         // images never materialize as a single byte[]; small inputs keep the in-memory path.
         long totalInnerBytes = 0;
         foreach (ProsperoInnerImageAssembler.InnerFile file in innerFiles)
+        {
+            token.ThrowIfCancellationRequested();
             totalInnerBytes += file.PayloadLength;
+        }
         return totalInnerBytes > options.FileBackedInnerImageThreshold
-            ? RunFileBacked(innerFiles, options, param, paramJson, sceSysFiles, playGoProject, tsSec, tsNsec, console)
-            : RunInMemory(innerFiles, options, param, paramJson, sceSysFiles, playGoProject, tsSec, tsNsec, console);
+            ? RunFileBacked(innerFiles, options, param, paramJson, sceSysFiles, playGoProject, tsSec, tsNsec, console, token)
+            : RunInMemory(innerFiles, options, param, paramJson, sceSysFiles, playGoProject, tsSec, tsNsec, console, token);
     }
 
     /// <summary>Parses a source PLGX when present, otherwise generates the observed default project.</summary>
@@ -379,8 +412,9 @@ public static class ProsperoDebugPackageBuilder
         DebugPackageBuildOptions buildOptions,
         ProsperoParam param, byte[] paramJson,
         IReadOnlyDictionary<string, byte[]> sceSysFiles, PlayGoProject playGoProject,
-        long tsSec, uint tsNsec, DebugPackageBuildLog console)
+        long tsSec, uint tsNsec, DebugPackageBuildLog console, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         string output = buildOptions.OutputPath;
         string contentId = buildOptions.ContentId;
         string passcode = buildOptions.Passcode;
@@ -393,7 +427,7 @@ public static class ProsperoDebugPackageBuilder
         BeginStage(stageClock, console, ProsperoBuildStage.InnerImage);
         var assembler = new ProsperoInnerImageAssembler(tsSec, tsNsec);
         ProsperoInnerImageAssembler.InnerImageResult innerResult = assembler.Build(
-            innerFiles, compressionMode, console.Progress, krakenLevel, krakenThreads);
+            innerFiles, compressionMode, console.Progress, krakenLevel, krakenThreads, cancellationToken);
         console.Finish();
         console.Log($" [inner] image {innerResult.Image.Length:N0} bytes, {innerResult.Ndblock:N0} mount blocks, {innerResult.InodeCount:N0} inodes");
         ProsperoCompressionMetrics compression = innerResult.CompressionMetrics;
@@ -433,12 +467,13 @@ public static class ProsperoDebugPackageBuilder
             },
         };
         var outerParams = new OuterPfsBuildParameters { TimestampSeconds = tsSec, TimestampNanoseconds = tsNsec, Seed = outerSeed };
-        OuterPfsBuildResult outerBuild = ProsperoOuterPfsBuilder.BuildPlaintext(outerFiles, outerParams, console.Progress);
+        OuterPfsBuildResult outerBuild = ProsperoOuterPfsBuilder.BuildPlaintext(outerFiles, outerParams, console.Progress, cancellationToken);
         // Per-block digest table for the container imagedigs entry (same SHA3-256-per-plaintext-block
         // table the file-backed path writes).
         (byte[] imageDigests, byte[] superblockIcv) = ProsperoOuterPfsBuilder.ComputeImageDigests(outerBuild);
         ProsperoOuterPfsBuilder.Encrypt(outerBuild, ProsperoKeys.DeriveOuterPfsXtsKeys(ekpfs, outerSeed).TweakKey,
-            ProsperoKeys.DeriveOuterPfsXtsKeys(ekpfs, outerSeed).DataKey, progress: console.Progress);
+            ProsperoKeys.DeriveOuterPfsXtsKeys(ekpfs, outerSeed).DataKey, progress: console.Progress,
+            cancellationToken: cancellationToken);
         console.Finish();
         byte[] outerImage = outerBuild.Plaintext;
         byte[] pfsImageDigest = Sha3.Sha3_256(outerBuild.Plaintext.AsSpan(outerBuild.SuperblockIndex * ProsperoOuterPfsBuilder.BlockSize, ProsperoOuterPfsBuilder.BlockSize));
@@ -580,6 +615,7 @@ public static class ProsperoDebugPackageBuilder
         // ---- 7. Write the output. ----
         string outDir = Path.GetDirectoryName(Path.GetFullPath(output))!;
         Directory.CreateDirectory(outDir);
+        cancellationToken.ThrowIfCancellationRequested();
         File.WriteAllBytes(output, fih);
         console.Log($"    wrote {output} ({fih.Length:N0} bytes)");
         ReportStage(console, ProsperoBuildStage.Finalize);
@@ -598,8 +634,9 @@ public static class ProsperoDebugPackageBuilder
         DebugPackageBuildOptions buildOptions,
         ProsperoParam param, byte[] paramJson,
         IReadOnlyDictionary<string, byte[]> sceSysFiles, PlayGoProject playGoProject,
-        long tsSec, uint tsNsec, DebugPackageBuildLog console)
+        long tsSec, uint tsNsec, DebugPackageBuildLog console, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         string output = buildOptions.OutputPath;
         string contentId = buildOptions.ContentId;
         string passcode = buildOptions.Passcode;
@@ -618,7 +655,7 @@ public static class ProsperoDebugPackageBuilder
             BeginStage(stageClock, console, ProsperoBuildStage.InnerImage);
             var assembler = new ProsperoInnerImageAssembler(tsSec, tsNsec);
             ProsperoInnerImageAssembler.InnerImageResult innerResult =
-                assembler.BuildToFile(innerFiles, innerImagePath, compressionMode, console.Progress, krakenLevel, krakenThreads);
+                assembler.BuildToFile(innerFiles, innerImagePath, compressionMode, console.Progress, krakenLevel, krakenThreads, cancellationToken);
             console.Finish();
             console.Log($" [inner] image {innerResult.ImageSize:N0} bytes, {innerResult.Ndblock:N0} mount blocks, {innerResult.InodeCount:N0} inodes");
             ProsperoCompressionMetrics compression = innerResult.CompressionMetrics;
@@ -659,7 +696,8 @@ public static class ProsperoDebugPackageBuilder
             // Write the outer PFS directly into its final FIH range (0x10000) so it is never copied.
             OuterPfsFileBuildResult outerBuild = ProsperoOuterPfsBuilder.BuildForPackageToFile(
                 outerSources, outerParams, output, encryptOutput: true, outerTweakKey, outerDataKey,
-                progress: console.Progress, outputOffset: ProsperoFihBuilder.HeaderRegionSize);
+                progress: console.Progress, outputOffset: ProsperoFihBuilder.HeaderRegionSize,
+                cancellationToken: cancellationToken);
             console.Finish();
             byte[] pfsImageDigest = Sha3.Sha3_256(outerBuild.SuperblockPlaintext);
             long outerLength = outerBuild.ImageLength;
@@ -860,6 +898,7 @@ public static class ProsperoDebugPackageBuilder
                     outerBuild.SuperblockPlaintext, includePfsImageXml: false);
             };
 
+            cancellationToken.ThrowIfCancellationRequested();
             BeginStage(stageClock, console, ProsperoBuildStage.Finalize);
             ProsperoFihBuilder.FinalizePrepositionedToFile(
                 cntMetadata, output, outerLength, FihVariant.Debug, outerBuild.SuperblockIndex,
@@ -874,6 +913,14 @@ public static class ProsperoDebugPackageBuilder
             long packageLength = new FileInfo(output).Length;
             console.Log($"    wrote {output} ({packageLength:N0} bytes)");
             return new DebugPackageBuildResult(Path.GetFullPath(output), packageLength, contentId, innerFiles.Count, true);
+        }
+        catch (OperationCanceledException)
+        {
+            // A cancelled build must not leave a partial package at the destination.
+            try { if (File.Exists(output)) File.Delete(output); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            throw;
         }
         finally
         {

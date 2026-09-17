@@ -204,7 +204,8 @@ public static class ProsperoPfsv3Writer
     /// <param name="blockSize">The logical block size (default 256 KiB). Must be positive.</param>
     /// <param name="level">Kraken level recorded in the container header (default 7).</param>
     public static (byte[] Container, IReadOnlyList<CompressedBlock> Blocks) WriteCompressed(
-        ReadOnlySpan<byte> payload, int blockSize = DefaultBlockSize, int level = DefaultLevel)
+        ReadOnlySpan<byte> payload, int blockSize = DefaultBlockSize, int level = DefaultLevel,
+        CancellationToken cancellationToken = default)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(blockSize);
         Compression.KrakenTuning.ValidateLevel(level);
@@ -216,6 +217,7 @@ public static class ProsperoPfsv3Writer
         long plainOffset = 0;
         for (int i = 0; i < blockCount; i++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             int plainSize = payload.Length == 0 ? 0 : (int)Math.Min(blockSize, payload.Length - plainOffset);
             ReadOnlySpan<byte> block = plainSize == 0 ? default : payload.Slice((int)plainOffset, plainSize);
             Compression.KrakenEncoder.EncodedBlock? candidate = plainSize > 0

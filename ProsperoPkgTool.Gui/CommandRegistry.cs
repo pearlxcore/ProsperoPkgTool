@@ -12,8 +12,21 @@ namespace ProsperoPkgTool.Gui;
 /// </summary>
 public static class CommandRegistry
 {
+    // Known Prospero SDK releases (newest first), sourced from the engine's release table so the GUI
+    // combo stays in sync with what --sdk accepts. Declared before the command lists because their
+    // static initializers read it.
+    private static readonly string[] SdkVersions = ProsperoPkgTool.Content.ProsperoSdkVersions.Releases
+        .OrderByDescending(release => release.Major)
+        .Select(release => release.Version)
+        .ToArray();
+
+    // The convert command is shared: it appears in the "Build & Tools" list and is the sole command
+    // of the dedicated Easy/Advanced Convert tabs, so the one instance is reused rather than cloned.
+    private static readonly CommandDef ConvertCommand = BuildConvertCommand();
+
     public static IReadOnlyList<CommandDef> PackageOperations { get; } = BuildPackageOperations();
     public static IReadOnlyList<CommandDef> ToolOperations { get; } = BuildToolOperations();
+    public static IReadOnlyList<CommandDef> ConvertOperations { get; } = [ConvertCommand];
 
     // Aggregate kept for callers that iterate everything.
     public static IReadOnlyList<CommandDef> All => [.. PackageOperations, .. ToolOperations];
@@ -36,31 +49,77 @@ public static class CommandRegistry
         Package("CNT entries (native-entries)", "Inspect",
             "List native CNT metadata entry IDs, names, offsets, sizes, and flags.",
             "native-entries"),
-        Package("Image summary (img_info)", "Inspect",
-            "Summarize package category, container, and decoded inner-image state.",
-            "img_info", usePasscode: true),
+        new CommandDef
+        {
+            Name = "Image summary (img_info)",
+            Group = "Inspect",
+            Title = "Summarize package category, container, and decoded inner-image state",
+            Description = "Print the package category and raw content type, envelope, segment geometry, and the decoded inner-PFS summary.",
+            CliWord = "img_info",
+            UsesSelectedPackage = true,
+            Fields =
+            [
+                Check("usePasscode", "Use the passcode field above", "Off = the all-zero default passcode (--no_passcode)", on: true),
+                Folder("tmpPath", "Temp folder (parity)", "Accepted for CLI parity; unused (--tmp_path)"),
+            ],
+            BuildArgs = values =>
+            {
+                var args = new List<string>();
+                if (Value(values, "tmpPath") is { Length: > 0 } tmpPath)
+                {
+                    args.Add("--tmp_path");
+                    args.Add(tmpPath);
+                }
+                if (values.GetValueOrDefault("usePasscode") == "1")
+                    AddPasscode(args, values);
+                else
+                    args.Add("--no_passcode");
+                args.Add(values["pkg"]);
+                return args.ToArray();
+            },
+        },
         new CommandDef
         {
             Name = "Image verify (img_verify)",
             Group = "Inspect",
             Title = "Run structural, CNT, PFS, NAPS, and inner-PFS checks",
-            Description = "Report every available verification check. Supply a reference package for patch overlays.",
+            Description = "Report every available check as PASS/FAIL/UNAVAILABLE/UNSUPPORTED/ERROR and an overall " +
+                          "PASSED/FAILED/INCOMPLETE outcome. A decode/crypto/IO failure after the payload opens is a " +
+                          "failure, never 'unavailable'. Supply a reference package for patch overlays.",
             CliWord = "img_verify",
             UsesSelectedPackage = true,
             Fields =
             [
+                Combo("policy", "Verification policy",
+                    ["DebugPackage", "Structural", "BuildAcceptance", "FullAvailableChecks"], "DebugPackage",
+                    ["Default: structural checks plus the full inner-payload decode",
+                     "Envelope only: structural bounds, FIH digest, CNT digests",
+                     "Build-acceptance depth (same checks as DebugPackage)",
+                     "Also require not-yet-implemented checks, so the result is INCOMPLETE rather than PASSED"]),
+                Check("strict", "Strict", "Fail (exit 6) when required checks are unavailable/unsupported (--strict)"),
+                Check("usePasscode", "Use the passcode field above", "Off = the all-zero default passcode (--no_passcode)", on: true),
                 File("ref", "Reference package", "PS5 packages (*.pkg)|*.pkg|All files (*.*)|*.*",
                     "Optional: base package for a patch/delta image"),
             ],
             BuildArgs = values =>
             {
                 var args = new List<string>();
+                if (Value(values, "policy") is { Length: > 0 } policy && policy != "DebugPackage")
+                {
+                    args.Add("--policy");
+                    args.Add(policy);
+                }
+                if (values.GetValueOrDefault("strict") == "1")
+                    args.Add("--strict");
                 if (Value(values, "ref") is { Length: > 0 } reference)
                 {
                     args.Add("--ref_pkg_path");
                     args.Add(reference);
                 }
-                AddPasscode(args, values);
+                if (values.GetValueOrDefault("usePasscode") == "1")
+                    AddPasscode(args, values);
+                else
+                    args.Add("--no_passcode");
                 args.Add(values["pkg"]);
                 return args.ToArray();
             },
@@ -106,6 +165,7 @@ public static class CommandRegistry
                     "Optional: base package for a patch/delta image"),
                 Check("repairOffsets", "Repair truncated 64-bit offsets",
                     "Reconstruct directory offsets from the metadata region (--repair-offsets); listing only"),
+                Check("usePasscode", "Use the passcode field above", "Off = the all-zero default passcode (--no_passcode)", on: true),
             ],
             BuildArgs = values =>
             {
@@ -122,7 +182,10 @@ public static class CommandRegistry
                 }
                 if (values.GetValueOrDefault("repairOffsets") == "1")
                     args.Add("--repair-offsets");
-                AddPasscode(args, values);
+                if (values.GetValueOrDefault("usePasscode") == "1")
+                    AddPasscode(args, values);
+                else
+                    args.Add("--no_passcode");
                 args.Add(values["pkg"]);
                 return args.ToArray();
             },
@@ -143,12 +206,19 @@ public static class CommandRegistry
                 File("ref", "Reference package", "PS5 packages (*.pkg)|*.pkg|All files (*.*)|*.*",
                     "Optional: base package for a patch/delta image"),
                 Check("verbose", "Verbose progress", "Show per-file extraction progress (--verbose)"),
+                Check("usePasscode", "Use the passcode field above", "Off = the all-zero default passcode (--no_passcode)", on: true),
+                Folder("tmpPath", "Temp folder (parity)", "Accepted for CLI parity; unused (--tmp_path)"),
             ],
             BuildArgs = values =>
             {
                 var args = new List<string>();
                 if (values.GetValueOrDefault("mount") == "1")
                     args.Add("--mount");
+                if (Value(values, "tmpPath") is { Length: > 0 } tmpPath)
+                {
+                    args.Add("--tmp_path");
+                    args.Add(tmpPath);
+                }
                 if (values.GetValueOrDefault("verbose") == "1")
                     args.Add("--verbose");
                 if (Value(values, "ref") is { Length: > 0 } reference)
@@ -156,7 +226,10 @@ public static class CommandRegistry
                     args.Add("--ref_pkg_path");
                     args.Add(reference);
                 }
-                AddPasscode(args, values);
+                if (values.GetValueOrDefault("usePasscode") == "1")
+                    AddPasscode(args, values);
+                else
+                    args.Add("--no_passcode");
                 string target = Value(values, "selection") is { Length: > 0 } selection
                     ? $"{values["pkg"]}:{selection}"
                     : values["pkg"];
@@ -191,19 +264,22 @@ public static class CommandRegistry
                     ["no compression", "Oodle Kraken / auto"]),
                 Slider("krakenLevel", "Kraken level (-4..9)", -4, 9, 7, "Recorded in the compressed image header (default 7)"),
                 Numeric("krakenThreads", "Kraken threads (0=auto)", 0, 256, 0, "0 = auto (processor count)"),
-                Text("sdk", "SDK override", string.Empty, "Optional: 9, 9.00.00.40 or 0x0900004000000411"),
-                Text("drmType", "DRM type override", string.Empty, "Optional: force e.g. standard to clear a locked source (default: keep source)"),
+                Check("sdkOverride", "Override the SDK version", "Apply the chosen SDK version to param.json (--sdk)"),
+                Combo("sdk", "SDK version", SdkVersions, SdkVersions[0]),
+                Combo("drmType", "DRM type override", ["keep source", "free", "standard", "upgradable"], "keep source",
+                    ["keep the source applicationDrmType", "free - no license required", "standard", "upgradable"]),
                 Numeric("playgoChunks", "PlayGo chunks", 1, 8192, 1, "Generated chunk count when no source playgo-chunk.dat (default 1)"),
                 Text("seed", "Outer seed (32 hex)", string.Empty, "Optional: deterministic seed, e.g. 000102030405060708090A0B0C0D0E0F"),
                 Folder("temp", "Temp folder", "Optional: workspace for large builds (blank = system temp)"),
                 Numeric("staleHours", "Reclaim stale temp after (hours)", 1, 720, 12, "Age before orphaned build workspaces are reclaimed"),
-                Check("noTempSweep", "Do not sweep stale temp workspaces", "Keep orphaned build workspaces (--no-temp-sweep)"),
-                Text("contentId", "Content ID", string.Empty, "Optional: overrides sce_sys/param.json"),
+                Check("sweepTemp", "Sweep stale temp workspaces", "Reclaim orphaned build workspaces (off = --no-temp-sweep)", on: true),
+                Text("contentId", "Content ID", string.Empty, "Auto-filled from the source sce_sys/param.json; optional override"),
+                Text("titleId", "Title ID", string.Empty, "Auto-filled from param.json; overrides titleId and the content id's title segment"),
+                Text("title", "Title", string.Empty, "Auto-filled from param.json; overrides the display title"),
                 Text("passcode", "Passcode (32 chars)", CommandDef.DefaultPasscode, "Default: all-zero fake passcode"),
-                Check("noPasscode", "Use the default all-zero passcode", "Ignore the passcode field (--no_passcode)"),
-                Check("noFself", "Skip module fake-signing", "Do not fake-sign ELF modules (--no_fself)"),
-                Check("noRightSprx", "Skip debug right.sprx injection", "Do not inject the debug module (--no_right_sprx)"),
-                Check("verbose", "Verbose progress", "Show stage progress (--verbose)"),
+                Check("fakeSign", "Fake-sign modules", "Fake-sign raw ELF modules into debug SELF (off = --no_fself)", on: true),
+                Check("injectRightSprx", "Inject debug right.sprx", "Inject the built-in debug module (off = --no_right_sprx)", on: true),
+                Check("verbose", "Verbose progress", "Show stage progress (--verbose)", on: true),
             ],
             BuildArgs = values =>
             {
@@ -230,12 +306,12 @@ public static class CommandRegistry
                     args.Add("--kraken-threads");
                     args.Add(krakenThreads);
                 }
-                if (Value(values, "sdk") is { Length: > 0 } sdk)
+                if (values.GetValueOrDefault("sdkOverride") == "1" && Value(values, "sdk") is { Length: > 0 } sdk)
                 {
                     args.Add("--sdk");
                     args.Add(sdk);
                 }
-                if (Value(values, "drmType") is { Length: > 0 } drmType)
+                if (Value(values, "drmType") is { Length: > 0 } drmType && drmType != "keep source")
                 {
                     args.Add("--drm-type");
                     args.Add(drmType);
@@ -255,7 +331,7 @@ public static class CommandRegistry
                     args.Add("--temp");
                     args.Add(temp);
                 }
-                if (values.GetValueOrDefault("noTempSweep") == "1")
+                if (values.GetValueOrDefault("sweepTemp") != "1")
                     args.Add("--no-temp-sweep");
                 if (Value(values, "staleHours") is { Length: > 0 } staleHours)
                 {
@@ -267,16 +343,24 @@ public static class CommandRegistry
                     args.Add("--content-id");
                     args.Add(contentId);
                 }
-                if (values.GetValueOrDefault("noPasscode") == "1")
-                    args.Add("--no_passcode");
-                else if (Value(values, "passcode") is { Length: > 0 } passcode)
+                if (Value(values, "titleId") is { Length: > 0 } titleId)
+                {
+                    args.Add("--title-id");
+                    args.Add(titleId);
+                }
+                if (Value(values, "title") is { Length: > 0 } title)
+                {
+                    args.Add("--title");
+                    args.Add(title);
+                }
+                if (Value(values, "passcode") is { Length: > 0 } passcode)
                 {
                     args.Add("--passcode");
                     args.Add(passcode);
                 }
-                if (values.GetValueOrDefault("noFself") == "1")
+                if (values.GetValueOrDefault("fakeSign") != "1")
                     args.Add("--no_fself");
-                if (values.GetValueOrDefault("noRightSprx") == "1")
+                if (values.GetValueOrDefault("injectRightSprx") != "1")
                     args.Add("--no_right_sprx");
                 args.Add("--out");
                 args.Add(Require(values, "out", "Output package"));
@@ -287,109 +371,7 @@ public static class CommandRegistry
                 return args.ToArray();
             },
         },
-        new CommandDef
-        {
-            Name = "Convert backup (convert)",
-            Group = "Create",
-            Title = "Convert a decrypted backup into a debug base package",
-            Description = "Substitute and fake-sign raw ELF modules from a decrypted backup, then build and report launch readiness.",
-            CliWord = "convert",
-            Fields =
-            [
-                Folder("backup", "Backup folder", "Decrypted backup root (contains sce_sys)"),
-                Save("out", "Output package", "PS5 packages (*.pkg)|*.pkg|All files (*.*)|*.*", "Required"),
-                Text("decrypted", "Decrypted subfolder", "decrypted", "Subfolder holding the decrypted title tree"),
-                Text("contentId", "Content ID", string.Empty, "Optional: overrides sce_sys/param.json"),
-                Text("passcode", "Passcode (32 chars)", CommandDef.DefaultPasscode, "Default: all-zero fake passcode"),
-                Check("noPasscode", "Use the default all-zero passcode", "Ignore the passcode field (--no_passcode)"),
-                Combo("compression", "Inner compression", ["stored", "kraken"], "kraken",
-                    ["no compression", "Oodle Kraken / auto"]),
-                Slider("krakenLevel", "Kraken level (-4..9)", -4, 9, 7, "Recorded in the compressed image header (default 7)"),
-                Numeric("krakenThreads", "Kraken threads (0=auto)", 0, 256, 0, "0 = auto (processor count)"),
-                Text("sdk", "SDK override", string.Empty, "Optional: 9, 9.00.00.40 or 0x0900004000000411"),
-                Text("drmType", "DRM type override", string.Empty, "Optional: force e.g. standard to clear a locked dump (default: keep source)"),
-                Folder("temp", "Temp folder", "Optional: workspace for large builds (blank = system temp)"),
-                Numeric("staleHours", "Reclaim stale temp after (hours)", 1, 720, 12, "Age before orphaned build workspaces are reclaimed"),
-                Check("noTempSweep", "Do not sweep stale temp workspaces", "Keep orphaned build workspaces (--no-temp-sweep)"),
-                Folder("staging", "Staging folder", "Optional: keep intermediate files here"),
-                Check("keepStaging", "Keep staging files", "Do not delete intermediates (--keep-staging)"),
-                Check("useEmbedded", "Use embedded right.sprx", "Use the built-in debug module (--use-embedded-right-sprx)"),
-                Check("verbose", "Verbose progress", "Show per-file and stage progress (--verbose)"),
-            ],
-            BuildArgs = values =>
-            {
-                var args = new List<string>();
-                args.Add("--out");
-                args.Add(Require(values, "out", "Output package"));
-                if (Value(values, "decrypted") is { Length: > 0 } decrypted)
-                {
-                    args.Add("--decrypted");
-                    args.Add(decrypted);
-                }
-                if (Value(values, "contentId") is { Length: > 0 } contentId)
-                {
-                    args.Add("--content-id");
-                    args.Add(contentId);
-                }
-                if (values.GetValueOrDefault("noPasscode") == "1")
-                    args.Add("--no_passcode");
-                else if (Value(values, "passcode") is { Length: > 0 } passcode)
-                {
-                    args.Add("--passcode");
-                    args.Add(passcode);
-                }
-                if (Value(values, "compression") is { Length: > 0 } compression)
-                {
-                    args.Add("--compression");
-                    args.Add(compression);
-                }
-                if (Value(values, "krakenLevel") is { Length: > 0 } krakenLevel)
-                {
-                    args.Add("--kraken-level");
-                    args.Add(krakenLevel);
-                }
-                if (Value(values, "krakenThreads") is { Length: > 0 } krakenThreads)
-                {
-                    args.Add("--kraken-threads");
-                    args.Add(krakenThreads);
-                }
-                if (Value(values, "sdk") is { Length: > 0 } sdk)
-                {
-                    args.Add("--sdk");
-                    args.Add(sdk);
-                }
-                if (Value(values, "drmType") is { Length: > 0 } drmType)
-                {
-                    args.Add("--drm-type");
-                    args.Add(drmType);
-                }
-                if (Value(values, "temp") is { Length: > 0 } temp)
-                {
-                    args.Add("--temp");
-                    args.Add(temp);
-                }
-                if (values.GetValueOrDefault("noTempSweep") == "1")
-                    args.Add("--no-temp-sweep");
-                if (Value(values, "staleHours") is { Length: > 0 } staleHours)
-                {
-                    args.Add("--stale-hours");
-                    args.Add(staleHours);
-                }
-                if (Value(values, "staging") is { Length: > 0 } staging)
-                {
-                    args.Add("--staging");
-                    args.Add(staging);
-                }
-                if (values.GetValueOrDefault("keepStaging") == "1")
-                    args.Add("--keep-staging");
-                if (values.GetValueOrDefault("useEmbedded") == "1")
-                    args.Add("--use-embedded-right-sprx");
-                if (values.GetValueOrDefault("verbose") == "1")
-                    args.Add("--verbose");
-                args.Add(Require(values, "backup", "Backup folder"));
-                return args.ToArray();
-            },
-        },
+        ConvertCommand,
 
         // -------------------------------------------------------------- GP5
         new CommandDef
@@ -587,6 +569,144 @@ public static class CommandRegistry
     ];
 
     // ==================================================================
+    // Convert: shared by the "Build & Tools" list and the Easy/Advanced tabs.
+    // Fields marked advanced-only are hidden in Easy; hidden fields still contribute their
+    // DefaultFor value on a run, so Easy == Advanced with the advanced knobs left at defaults.
+    // ==================================================================
+    private static CommandDef BuildConvertCommand() => new()
+    {
+        Name = "Convert backup (convert)",
+        Group = "Create",
+        Title = "Convert a decrypted backup into a debug base package",
+        Description = "Substitute and fake-sign raw ELF modules from a decrypted backup, then build and report launch readiness.",
+        CliWord = "convert",
+        Fields =
+        [
+            // --- Easy + advanced ---
+            Folder("backup", "Backup folder", "Decrypted backup root (contains sce_sys)"),
+            Save("out", "Output package", "PS5 packages (*.pkg)|*.pkg|All files (*.*)|*.*", "Required"),
+            Text("title", "Title", string.Empty, "Auto-filled from param.json; overrides the display title"),
+            Text("contentId", "Content ID", string.Empty, "Auto-filled from the source sce_sys/param.json; optional override"),
+            Text("passcode", "Passcode (32 chars)", CommandDef.DefaultPasscode, "Default: all-zero fake passcode"),
+            Combo("drmType", "DRM type", ["keep source", "free", "standard", "upgradable"], "keep source",
+                ["keep the source applicationDrmType", "free - no license required", "standard", "upgradable"],
+                easyDefault: "free"),
+            Check("sdkOverride", "Override the SDK version", "Apply the chosen SDK version to param.json (--sdk)",
+                easyDefault: "1"),
+            Combo("sdk", "SDK version", SdkVersions, SdkVersions[0], easyDefault: SdkVersions[^1]),
+            Check("verbose", "Verbose progress", "Show per-file and stage progress (--verbose)", on: true),
+
+            // --- Advanced only ---
+            Text("titleId", "Title ID", string.Empty,
+                "Auto-filled from param.json; overrides titleId and the content id's title segment", advancedOnly: true),
+            Check("noPasscode", "Use the all-zero default passcode",
+                "Emit --no_passcode instead of the passcode field", advancedOnly: true),
+            Text("decrypted", "Decrypted subfolder", "decrypted",
+                "Subfolder holding the raw ELF copies (--decrypted; default decrypted)", advancedOnly: true),
+            Combo("compression", "Inner compression", ["stored", "kraken"], "kraken",
+                ["no compression", "Oodle Kraken / auto"], advancedOnly: true),
+            Slider("krakenLevel", "Kraken level (-4..9)", -4, 9, 7,
+                "Recorded in the compressed image header (default 7)", advancedOnly: true),
+            Numeric("krakenThreads", "Kraken threads (0=auto)", 0, 256, 0,
+                "0 = auto (processor count)", advancedOnly: true),
+            Folder("temp", "Temp folder", "Optional: workspace for large builds (blank = system temp)", advancedOnly: true),
+            Numeric("staleHours", "Reclaim stale temp after (hours)", 1, 720, 12,
+                "Age before orphaned build workspaces are reclaimed", advancedOnly: true),
+            Check("sweepTemp", "Sweep stale temp workspaces",
+                "Reclaim orphaned build workspaces (off = --no-temp-sweep)", on: true, advancedOnly: true),
+            Folder("staging", "Staging folder", "Optional: keep intermediate files here", advancedOnly: true),
+            Check("removeStaging", "Remove staging files (delete intermediate)",
+                "Delete the intermediate tree after the build (off = --keep-staging)", on: true, advancedOnly: true),
+            Check("useEmbedded", "Use embedded right.sprx",
+                "Drop the backup's module and inject the built-in debug one (--use-embedded-right-sprx)",
+                on: true, advancedOnly: true),
+        ],
+        BuildArgs = values =>
+        {
+            var args = new List<string>();
+            args.Add("--out");
+            args.Add(Require(values, "out", "Output package"));
+            if (Value(values, "contentId") is { Length: > 0 } contentId)
+            {
+                args.Add("--content-id");
+                args.Add(contentId);
+            }
+            if (Value(values, "titleId") is { Length: > 0 } titleId)
+            {
+                args.Add("--title-id");
+                args.Add(titleId);
+            }
+            if (Value(values, "title") is { Length: > 0 } title)
+            {
+                args.Add("--title");
+                args.Add(title);
+            }
+            if (values.GetValueOrDefault("noPasscode") == "1")
+                args.Add("--no_passcode");
+            else if (Value(values, "passcode") is { Length: > 0 } passcode)
+            {
+                args.Add("--passcode");
+                args.Add(passcode);
+            }
+            if (Value(values, "decrypted") is { Length: > 0 } decrypted)
+            {
+                args.Add("--decrypted");
+                args.Add(decrypted);
+            }
+            if (Value(values, "compression") is { Length: > 0 } compression)
+            {
+                args.Add("--compression");
+                args.Add(compression);
+            }
+            if (Value(values, "krakenLevel") is { Length: > 0 } krakenLevel)
+            {
+                args.Add("--kraken-level");
+                args.Add(krakenLevel);
+            }
+            if (Value(values, "krakenThreads") is { Length: > 0 } krakenThreads)
+            {
+                args.Add("--kraken-threads");
+                args.Add(krakenThreads);
+            }
+            if (values.GetValueOrDefault("sdkOverride") == "1" && Value(values, "sdk") is { Length: > 0 } sdk)
+            {
+                args.Add("--sdk");
+                args.Add(sdk);
+            }
+            if (Value(values, "drmType") is { Length: > 0 } drmType && drmType != "keep source")
+            {
+                args.Add("--drm-type");
+                args.Add(drmType);
+            }
+            if (Value(values, "temp") is { Length: > 0 } temp)
+            {
+                args.Add("--temp");
+                args.Add(temp);
+            }
+            if (values.GetValueOrDefault("sweepTemp") != "1")
+                args.Add("--no-temp-sweep");
+            if (Value(values, "staleHours") is { Length: > 0 } staleHours)
+            {
+                args.Add("--stale-hours");
+                args.Add(staleHours);
+            }
+            if (Value(values, "staging") is { Length: > 0 } staging)
+            {
+                args.Add("--staging");
+                args.Add(staging);
+            }
+            if (values.GetValueOrDefault("removeStaging") != "1")
+                args.Add("--keep-staging");
+            if (values.GetValueOrDefault("useEmbedded") == "1")
+                args.Add("--use-embedded-right-sprx");
+            if (values.GetValueOrDefault("verbose") == "1")
+                args.Add("--verbose");
+            args.Add(Require(values, "backup", "Backup folder"));
+            return args.ToArray();
+        },
+    };
+
+    // ==================================================================
     // Helpers
     // ==================================================================
     private static CommandDef Package(string name, string group, string description, string cliWord, bool usePasscode = false) => new()
@@ -634,11 +754,17 @@ public static class CommandRegistry
         new() { Id = id, Label = label, Kind = FieldKind.File, Filter = filter, Hint = hint };
     private static CommandField Save(string id, string label, string filter, string hint = "") =>
         new() { Id = id, Label = label, Kind = FieldKind.SaveFile, Filter = filter, Hint = hint };
-    private static CommandField Folder(string id, string label, string hint = "") =>
-        new() { Id = id, Label = label, Kind = FieldKind.Folder, Hint = hint };
-    private static CommandField Text(string id, string label, string @default = "", string hint = "") =>
-        new() { Id = id, Label = label, Kind = FieldKind.Text, Default = @default, Hint = hint };
-    private static CommandField Numeric(string id, string label, int minimum, int maximum, int @default, string hint = "") =>
+    private static CommandField Folder(string id, string label, string hint = "", bool advancedOnly = false) =>
+        new() { Id = id, Label = label, Kind = FieldKind.Folder, Hint = hint, AdvancedOnly = advancedOnly };
+    private static CommandField Text(string id, string label, string @default = "", string hint = "",
+        bool advancedOnly = false, string? easyDefault = null) =>
+        new()
+        {
+            Id = id, Label = label, Kind = FieldKind.Text, Default = @default, Hint = hint,
+            AdvancedOnly = advancedOnly, EasyDefault = easyDefault,
+        };
+    private static CommandField Numeric(string id, string label, int minimum, int maximum, int @default, string hint = "",
+        bool advancedOnly = false) =>
         new()
         {
             Id = id,
@@ -648,8 +774,10 @@ public static class CommandRegistry
             Maximum = maximum,
             Default = @default.ToString(System.Globalization.CultureInfo.InvariantCulture),
             Hint = hint,
+            AdvancedOnly = advancedOnly,
         };
-    private static CommandField Slider(string id, string label, int minimum, int maximum, int @default, string hint = "") =>
+    private static CommandField Slider(string id, string label, int minimum, int maximum, int @default, string hint = "",
+        bool advancedOnly = false) =>
         new()
         {
             Id = id,
@@ -659,9 +787,20 @@ public static class CommandRegistry
             Maximum = maximum,
             Default = @default.ToString(System.Globalization.CultureInfo.InvariantCulture),
             Hint = hint,
+            AdvancedOnly = advancedOnly,
         };
-    private static CommandField Combo(string id, string label, string[] choices, string @default, string[]? remarks = null) =>
-        new() { Id = id, Label = label, Kind = FieldKind.Combo, Choices = choices, Default = @default, ChoiceRemarks = remarks };
-    private static CommandField Check(string id, string label, string hint = "") =>
-        new() { Id = id, Label = label, Kind = FieldKind.Check, Hint = hint };
+    private static CommandField Combo(string id, string label, string[] choices, string @default, string[]? remarks = null,
+        bool advancedOnly = false, string? easyDefault = null) =>
+        new()
+        {
+            Id = id, Label = label, Kind = FieldKind.Combo, Choices = choices, Default = @default, ChoiceRemarks = remarks,
+            AdvancedOnly = advancedOnly, EasyDefault = easyDefault,
+        };
+    private static CommandField Check(string id, string label, string hint = "", bool on = false,
+        bool advancedOnly = false, string? easyDefault = null) =>
+        new()
+        {
+            Id = id, Label = label, Kind = FieldKind.Check, Hint = hint, Default = on ? "1" : "0",
+            AdvancedOnly = advancedOnly, EasyDefault = easyDefault,
+        };
 }

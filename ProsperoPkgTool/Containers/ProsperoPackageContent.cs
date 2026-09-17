@@ -111,11 +111,11 @@ public static class ProsperoPackageContent
             {
                 byte[] naps = pfs.ReadNaps(xts);
                 long innerLength = pfs.InnerImageLength;
-                IReadOnlyList<ProsperoPs5InnerImageReader.InnerBlock> blocks =
-                    ProsperoPs5InnerImageReader.WalkBlocks(naps, innerLength);
-                long mountLength = ProsperoPs5InnerImageReader.MountSize(blocks);
-
                 byte[] ReadRegion(long offset, int length) => pfs.ReadInnerImageRegion(xts, offset, length);
+                IReadOnlyList<ProsperoPs5InnerImageReader.InnerBlock> blocks =
+                    NapsDialectRegistry.Select(naps, innerLength, candidate =>
+                        NapsDialectRegistry.ProbePfs(candidate, innerLength, ReadRegion, ReadInnerSuperblockHint(stream)));
+                long mountLength = ProsperoPs5InnerImageReader.MountSize(blocks);
 
                 IReadOnlyList<ProsperoInnerPfsReader.Entry> entries;
                 using (var mount = new ProsperoInnerMountStream(blocks, innerLength, ReadRegion))
@@ -135,6 +135,43 @@ public static class ProsperoPackageContent
         {
             stream.Dispose();
             throw;
+        }
+    }
+
+    /// <summary>
+    /// True when a finalized-debug package's decoded inner mount is too large to materialize as one
+    /// <c>byte[]</c> (its uncompressed size exceeds <see cref="int.MaxValue"/>), so callers must use
+    /// <see cref="ReadFileBacked"/>. The compressed PFS size is not a reliable proxy: a ~1.3 GiB
+    /// package can decode to a ~3.5 GiB mount and would otherwise fail the in-memory size check.
+    /// </summary>
+    public static bool RequiresFileBacked(string packagePath, string? passcode = null)
+    {
+        ProsperoPackageInspection inspection = ProsperoPackageReader.Read(packagePath);
+        if (inspection.Kind != ProsperoPackageKind.FinalizedDebug || inspection.Fih is not { } fih)
+            return false;
+        if (fih.PfsSize > (1L << 31))
+            return true;
+        if (inspection.Cnt.ContentId.Length != 36)
+            return false;
+        try
+        {
+            using var stream = new FileStream(Path.GetFullPath(packagePath), FileMode.Open, FileAccess.Read, FileShare.Read);
+            OuterPfsReader pfs = OuterPfsReader.Open(stream, checked((long)fih.PfsOffset), checked((long)fih.PfsSize),
+                ReadOuterSuperblockIndexHint(stream, (long)fih.PfsSize));
+            byte[] ekpfs = ProsperoKeys.ComputeEkpfs(inspection.Cnt.ContentId,
+                passcode ?? Gp5.Gp5Constants.DefaultPasscode);
+            (byte[] tweak, byte[] data) = ProsperoKeys.DeriveOuterPfsXtsKeys(ekpfs, pfs.Seed);
+            using var xts = new AesXts(data, tweak);
+            byte[] naps = pfs.ReadNaps(xts);
+            long mountLength = ProsperoPs5InnerImageReader.MountSize(
+                NapsDialectRegistry.Select(naps, pfs.InnerImageLength, candidate =>
+                    NapsDialectRegistry.ProbePfs(candidate, pfs.InnerImageLength,
+                        (offset, length) => pfs.ReadInnerImageRegion(xts, offset, length), ReadInnerSuperblockHint(stream))));
+            return mountLength > int.MaxValue;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or CryptographicException or NotSupportedException or ArgumentException)
+        {
+            return false; // let the normal path surface the real error
         }
     }
 
@@ -192,8 +229,10 @@ public static class ProsperoPackageContent
         using var xts = new AesXts(data, tweak);
         byte[] naps = pfs.ReadNaps(xts);
         byte[] image = pfs.ReadInnerImage(xts);
-        IReadOnlyList<ProsperoPs5InnerImageReader.InnerBlock> blocks = ProsperoPs5InnerImageReader.WalkBlocks(naps, image.Length);
-        byte[] mount = ProsperoPs5InnerImageReader.ReconstructMount(image, naps);
+        IReadOnlyList<ProsperoPs5InnerImageReader.InnerBlock> blocks = NapsDialectRegistry.Select(naps, image.Length,
+            candidate => NapsDialectRegistry.ProbePfs(candidate, image.Length,
+                (offset, length) => image.AsSpan(checked((int)offset), length).ToArray(), ReadInnerSuperblockHint(stream)));
+        byte[] mount = ProsperoPs5InnerImageReader.ReconstructMount(image, blocks);
         return new ProsperoDecodedPackage(inspection, image, naps, mount, blocks, pfs.VerifySuperblockIcv());
     }
 
@@ -324,34 +363,126 @@ public static class ProsperoPackageContent
     }
 }
 
-public enum VerificationState { Pass, Fail, Unavailable, NotPresent }
-public sealed record VerificationCheck(string Name, VerificationState State, string Detail);
+/// <summary>
+/// Outcome of a single verification check.
+/// <list type="bullet">
+/// <item><see cref="Pass"/> — the check ran and succeeded.</item>
+/// <item><see cref="Fail"/> — the data was available and the check ran, but the content/format/integrity was wrong.</item>
+/// <item><see cref="Unavailable"/> — required key material or input (e.g. a retail key, a patch reference) is genuinely absent.</item>
+/// <item><see cref="Unsupported"/> — this implementation does not currently perform that check.</item>
+/// <item><see cref="Error"/> — an I/O, decode, crypto, or malformed-data failure prevented the check from completing.</item>
+/// <item><see cref="NotPresent"/> — the optional structure the check targets is absent (not a failure).</item>
+/// </list>
+/// </summary>
+public enum VerificationState { Pass, Fail, Unavailable, Unsupported, Error, NotPresent }
+
+/// <summary>Selects which checks are mandatory, so acceptance cannot be claimed from a partial report.</summary>
+public enum VerificationPolicy
+{
+    /// <summary>Envelope level only: structural bounds, FIH digest, CNT digests.</summary>
+    Structural,
+    /// <summary>Default: the structural checks plus the full inner-payload decode.</summary>
+    DebugPackage,
+    /// <summary>Build acceptance: everything <see cref="DebugPackage"/> requires, at the same depth.</summary>
+    BuildAcceptance,
+    /// <summary>Every available check, including the ones not yet implemented (so the report stays incomplete).</summary>
+    FullAvailableChecks,
+}
+
+/// <summary>Overall package verdict derived from the individual checks.</summary>
+public enum VerificationOutcome { Passed, Failed, Incomplete }
+
+/// <summary>
+/// A single verification result. <paramref name="Required"/> marks the checks that must be performed
+/// for the policy in force; a required check that is merely <see cref="VerificationState.Unavailable"/>
+/// or <see cref="VerificationState.Unsupported"/> makes the report
+/// <see cref="VerificationOutcome.Incomplete"/> instead of allowing it to look successful.
+/// </summary>
+public sealed record VerificationCheck(string Name, VerificationState State, string Detail, bool Required = true);
+
 public sealed record ProsperoPackageVerificationReport(IReadOnlyList<VerificationCheck> Checks)
 {
-    public bool HasFailure => Checks.Any(c => c.State == VerificationState.Fail);
+    /// <summary>
+    /// True when a check ran and failed, or could not complete after the payload was opened
+    /// (decode/crypto/I/O). Missing keys are <see cref="VerificationState.Unavailable"/>, not failures.
+    /// </summary>
+    public bool HasFailure => Checks.Any(c => c.State is VerificationState.Fail or VerificationState.Error);
+
+    /// <summary>True when a check could not complete because of an execution failure rather than a wrong result.</summary>
+    public bool HasError => Checks.Any(c => c.State == VerificationState.Error);
+
+    /// <summary>Every required check was actually performed (no required unavailable/unsupported checks).</summary>
+    public bool IsComplete => !Checks.Any(c => c.Required &&
+        c.State is VerificationState.Unavailable or VerificationState.Unsupported);
+
+    /// <summary>Distinguishes passed / failed / incomplete for callers that gate on acceptance.</summary>
+    public VerificationOutcome Outcome =>
+        HasFailure ? VerificationOutcome.Failed :
+        IsComplete ? VerificationOutcome.Passed : VerificationOutcome.Incomplete;
 }
 
 /// <summary>High-level, evidence-labelled verification over independently implemented primitives.</summary>
 public static class ProsperoPackageVerifier
 {
+    // Policy requirement masks: a check is Required when its mask intersects the selected policy.
+    private const int ScopeStructural = 1;
+    private const int ScopeDebug = 2;
+    private const int ScopeBuild = 4;
+    private const int ScopeFull = 8;
+    private const int ScopeEnvelope = ScopeStructural | ScopeDebug | ScopeBuild | ScopeFull;
+    private const int ScopePayload = ScopeDebug | ScopeBuild | ScopeFull;
+
+    /// <summary>Verify using the default <see cref="VerificationPolicy.DebugPackage"/> policy.</summary>
     public static ProsperoPackageVerificationReport Verify(string packagePath, string? passcode = null,
         string? referencePackagePath = null)
+        => Verify(packagePath, passcode, referencePackagePath, VerificationPolicy.DebugPackage);
+
+    public static ProsperoPackageVerificationReport Verify(string packagePath, string? passcode,
+        string? referencePackagePath, VerificationPolicy policy)
     {
+        int scope = policy switch
+        {
+            VerificationPolicy.Structural => ScopeStructural,
+            VerificationPolicy.BuildAcceptance => ScopeBuild,
+            VerificationPolicy.FullAvailableChecks => ScopeFull,
+            _ => ScopeDebug,
+        };
         var checks = new List<VerificationCheck>();
+        void Add(string name, VerificationState state, string detail, int mask)
+            => checks.Add(new(name, state, detail, (mask & scope) != 0));
+
         ProsperoPackageInspection inspection;
         try { inspection = ProsperoPackageReader.Read(packagePath); }
         catch (Exception ex) when (ex is IOException or InvalidDataException)
         {
-            return new([new("Package structural bounds", VerificationState.Fail, ex.Message)]);
+            return new([new("Package structural bounds", VerificationState.Fail, ex.ToString())]);
         }
-        checks.Add(new("Package structural bounds", inspection.Structure.IsValid ? VerificationState.Pass : VerificationState.Fail,
-            inspection.Structure.IsValid ? "FIH/CNT ranges are valid" : string.Join("; ", inspection.Structure.Issues.Where(i => i.IsError).Select(i => i.Code))));
-        VerifyCnt(packagePath, inspection, checks);
+
+        Add("Package structural bounds", inspection.Structure.IsValid ? VerificationState.Pass : VerificationState.Fail,
+            inspection.Structure.IsValid ? "FIH/CNT ranges are valid" : string.Join("; ", inspection.Structure.Issues.Where(i => i.IsError).Select(i => i.Code)),
+            ScopeEnvelope);
+        VerifyCnt(packagePath, inspection, Add);
         bool si = ProsperoPackageContent.TryOpenSi(packagePath, inspection, out string? siError);
-        checks.Add(new("SI consistency", si ? VerificationState.Pass : inspection.Segments.Any(s => s.Name == "SI" && s.Size > 0) ? VerificationState.Fail : VerificationState.NotPresent,
-            si ? "Stored SI ZIP is readable" : siError ?? "No SI segment"));
-        checks.Add(VerifyFihDigest(packagePath, inspection));
-        checks.Add(new("RSA signature", VerificationState.Unavailable, "Public-key signature verification is not independently implemented"));
+        Add("SI ZIP readability", si ? VerificationState.Pass : inspection.Segments.Any(s => s.Name == "SI" && s.Size > 0) ? VerificationState.Fail : VerificationState.NotPresent,
+            si ? "Stored SI ZIP opens and its directory enumerates (member contents are not parsed)" : siError ?? "No SI segment",
+            ScopeFull);
+        VerificationCheck fih = VerifyFihDigest(packagePath, inspection);
+        Add(fih.Name, fih.State, fih.Detail, ScopeEnvelope);
+        Add("RSA signature", VerificationState.Unsupported, "Public-key signature verification is not implemented in this clean-room build", ScopeFull);
+
+        bool retail = inspection.Kind == ProsperoPackageKind.FinalizedRetail;
+        bool patchWithoutReference = inspection.Kind == ProsperoPackageKind.FinalizedPatchDebug
+            && string.IsNullOrWhiteSpace(referencePackagePath);
+        if (retail || patchWithoutReference)
+        {
+            // The keyed payload cannot even be opened: report the payload checks as genuinely
+            // unavailable (a support boundary), never as a corruption/decoder failure.
+            string detail = retail
+                ? "Retail payload key material is unavailable to this clean-room reader"
+                : "Patch payload reconstruction requires a base/reference package path";
+            AddPayloadChecks(Add, VerificationState.Unavailable, detail, ScopePayload);
+            return new(checks);
+        }
 
         try
         {
@@ -359,49 +490,67 @@ public static class ProsperoPackageVerifier
             // in-memory reader rejects them, so mirror img_info and reconstruct via the
             // file-backed reader instead of reporting the whole payload as unavailable.
             bool large = inspection.Kind == ProsperoPackageKind.FinalizedDebug &&
-                inspection.Fih is { } fih && fih.PfsSize > (1L << 31);
+                ProsperoPackageContent.RequiresFileBacked(packagePath, passcode);
             if (large)
             {
                 using ProsperoFileBackedPackage fileBacked = ProsperoPackageContent.ReadFileBacked(packagePath, passcode);
                 // Verification keeps its full decode pass (validating every stored/Kraken block) but
                 // streams it on demand instead of reconstructing a multi-GB temp mount.
                 fileBacked.DecodeAllBlocks();
-                AddDecodedChecks(checks, fileBacked.Blocks, fileBacked.Entries, fileBacked.OuterPfsIcvValid,
+                AddDecodedChecks(Add, fileBacked.Blocks, fileBacked.Entries, fileBacked.OuterPfsIcvValid,
                     ProsperoPackageKind.FinalizedDebug);
             }
             else
             {
                 ProsperoDecodedPackage decoded = ProsperoPackageContent.Read(packagePath, passcode, referencePackagePath);
-                AddDecodedChecks(checks, decoded.Blocks, ProsperoInnerPfsReader.Enumerate(decoded.Mount),
+                AddDecodedChecks(Add, decoded.Blocks, ProsperoInnerPfsReader.Enumerate(decoded.Mount),
                     decoded.OuterPfsIcvValid, decoded.Inspection.Kind);
             }
         }
-        catch (Exception ex) when (ex is InvalidDataException or IOException or CryptographicException)
+        catch (Exception ex) when (ex is InvalidDataException or IOException or CryptographicException or NotSupportedException or ArgumentException)
         {
-            checks.Add(new("Outer PFS superblock ICV", VerificationState.Unavailable, "Encrypted payload: key required or rejected"));
-            checks.Add(new("NAPS structure", VerificationState.Unavailable, "Encrypted payload unavailable"));
-            checks.Add(new("Kraken decode/reconstruction", VerificationState.Unavailable, "Encrypted payload unavailable"));
-            checks.Add(new("Inner PFS structural integrity", VerificationState.Unavailable, "Encrypted payload unavailable"));
-            checks.Add(new("PFS block hashes/digests", VerificationState.Unavailable, "Encrypted payload unavailable"));
-            checks.Add(new("PlayGo CRC", VerificationState.Unavailable, "Encrypted payload unavailable"));
+            // For a debug/patch package the key is derivable, so reaching this catch means the
+            // payload was openable and the failure is a real decode/integrity/IO problem. It must
+            // be reported as an error (with the original exception preserved) rather than softened
+            // into a missing-key "unavailable" state.
+            VerificationState state = ex is NotSupportedException
+                ? VerificationState.Unsupported
+                : VerificationState.Error;
+            AddPayloadChecks(Add, state, ex.ToString(), ScopePayload);
         }
         return new(checks);
     }
 
-    private static void AddDecodedChecks(List<VerificationCheck> checks,
+    /// <summary>
+    /// The four keyed payload checks that share a single availability/outcome, plus the two
+    /// not-yet-implemented independent checks (which stay <see cref="VerificationState.Unsupported"/>).
+    /// </summary>
+    private static void AddPayloadChecks(Action<string, VerificationState, string, int> add,
+        VerificationState state, string detail, int mask)
+    {
+        add("Outer PFS superblock ICV", state, detail, mask);
+        add("NAPS structure", state, detail, mask);
+        add("Kraken decode/reconstruction", state, detail, mask);
+        add("Inner PFS structural integrity", state, detail, mask);
+        add("PFS block hashes/digests", VerificationState.Unsupported, "Per-block digest verification is not implemented", ScopeFull);
+        add("PlayGo CRC", VerificationState.Unsupported, "Independent PlayGo CRC verification is not implemented", ScopeFull);
+    }
+
+    private static void AddDecodedChecks(Action<string, VerificationState, string, int> add,
         IReadOnlyList<ProsperoPs5InnerImageReader.InnerBlock> blocks,
         IReadOnlyList<ProsperoInnerPfsReader.Entry> entries, bool icvValid, ProsperoPackageKind kind)
     {
-        checks.Add(new("Outer PFS superblock ICV", icvValid ? VerificationState.Pass : VerificationState.Fail,
-            icvValid ? "SHA3-256 ICV matches" : "SHA3-256 ICV mismatch"));
-        checks.Add(new("NAPS structure", VerificationState.Pass,
+        add("Outer PFS superblock ICV", icvValid ? VerificationState.Pass : VerificationState.Fail,
+            icvValid ? "SHA3-256 ICV matches" : "SHA3-256 ICV mismatch", ScopePayload);
+        add("NAPS structure", VerificationState.Pass,
             kind == ProsperoPackageKind.FinalizedPatchDebug
                 ? "RUN-addressed patch NAPS reconstructed"
-                : $"{blocks.Count} CblockInfo data blocks walked"));
-        checks.Add(new("Kraken decode/reconstruction", VerificationState.Pass, "Inner mount reconstructed"));
-        checks.Add(new("Inner PFS structural integrity", VerificationState.Pass, $"{entries.Count} logical entries"));
-        checks.Add(new("PFS block hashes/digests", VerificationState.Unavailable, "Per-block foreign-layout verifier not implemented"));
-        checks.Add(new("PlayGo CRC", VerificationState.Unavailable, "No independently proven CRC location/verifier"));
+                : $"{blocks.Count} CblockInfo data blocks walked", ScopePayload);
+        add("Kraken decode/reconstruction", VerificationState.Pass,
+            "All stored/Kraken/alias blocks decoded", ScopePayload);
+        add("Inner PFS structural integrity", VerificationState.Pass, $"{entries.Count} logical entries", ScopePayload);
+        add("PFS block hashes/digests", VerificationState.Unsupported, "Per-block digest verification is not implemented", ScopeFull);
+        add("PlayGo CRC", VerificationState.Unsupported, "Independent PlayGo CRC verification is not implemented", ScopeFull);
     }
 
     /// <summary>
@@ -434,16 +583,17 @@ public static class ProsperoPackageVerifier
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException)
         {
-            return new("FIH digest", VerificationState.Unavailable, ex.Message);
+            return new("FIH digest", VerificationState.Error, ex.ToString());
         }
     }
 
-    private static void VerifyCnt(string packagePath, ProsperoPackageInspection inspection, List<VerificationCheck> checks)
+    private static void VerifyCnt(string packagePath, ProsperoPackageInspection inspection,
+        Action<string, VerificationState, string, int> add)
     {
         try
         {
             ProsperoCntEntry? digestEntry = inspection.Entries.FirstOrDefault(e => e.Id == (uint)CntEntryId.Digests);
-            if (digestEntry is null) { checks.Add(new("CNT body/entry digests", VerificationState.NotPresent, "DIGESTS entry is absent")); return; }
+            if (digestEntry is null) { add("CNT body/entry digests", VerificationState.NotPresent, "DIGESTS entry is absent", ScopeEnvelope); return; }
             byte[] digests = ProsperoPackageContent.ReadCntEntry(packagePath, inspection, digestEntry);
             ProsperoCntEntry[] sorted = inspection.Entries.OrderBy(e => e.Id).ToArray();
             if (digests.Length != sorted.Length * 32) throw new InvalidDataException("DIGESTS length does not match the CNT entry count.");
@@ -465,14 +615,14 @@ public static class ProsperoPackageVerifier
                 if (!matched)
                     throw new InvalidDataException($"Digest mismatch for CNT entry 0x{sorted[i].Id:X8}.");
             }
-            checks.Add(new("CNT body/entry digests", VerificationState.Pass, $"{sorted.Length - 1} entry digests match"));
-            checks.Add(new("GeneralDigests", VerifyGeneral(packagePath, inspection) ? VerificationState.Pass : VerificationState.Fail,
-                "Verified param/playgo slots supported by the clean-room writer"));
+            add("CNT body/entry digests", VerificationState.Pass, $"{sorted.Length - 1} entry digests match", ScopeEnvelope);
+            add("GeneralDigests", VerifyGeneral(packagePath, inspection) ? VerificationState.Pass : VerificationState.Fail,
+                "Verified param/playgo slots supported by the clean-room writer", ScopeEnvelope);
         }
         catch (Exception ex) when (ex is InvalidDataException or IOException)
         {
-            checks.Add(new("CNT body/entry digests", VerificationState.Fail, ex.Message));
-            checks.Add(new("GeneralDigests", VerificationState.Unavailable, "CNT digest table is invalid"));
+            add("CNT body/entry digests", VerificationState.Fail, ex.Message, ScopeEnvelope);
+            add("GeneralDigests", VerificationState.Unavailable, "CNT digest table is invalid", ScopeEnvelope);
         }
     }
 

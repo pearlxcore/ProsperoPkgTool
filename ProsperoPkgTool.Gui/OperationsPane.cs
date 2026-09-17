@@ -1,3 +1,5 @@
+using System.Text.Json;
+
 namespace ProsperoPkgTool.Gui;
 
 public sealed class OperationsPane : UserControl
@@ -9,7 +11,9 @@ public sealed class OperationsPane : UserControl
     private readonly Button _cancel = new() { Text = "Cancel", Width = 90, Enabled = false };
     private readonly SplitContainer _split = new() { Dock = DockStyle.Fill };
     private readonly Dictionary<string, Control> _fieldControls = new(StringComparer.Ordinal);
+    private readonly ToolTip _tips = new();
     private CommandDef? _current;
+    private string? _autoOutput;
 
     public OperationsPane()
     {
@@ -22,6 +26,15 @@ public sealed class OperationsPane : UserControl
     public event Action<CommandDef?>? SelectionChanged;
     public SplitContainer Split => _split;
     public bool CanRun => _current is not null;
+
+    /// <summary>
+    /// When false this pane is a simplified (Easy) view: fields marked <see cref="CommandField.AdvancedOnly"/>
+    /// are hidden, and hidden fields use their Easy default when a run is submitted. Set before
+    /// <see cref="SetCommands"/> so the first render honors the mode. Defaults to true (full view).
+    /// </summary>
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+    [System.ComponentModel.Browsable(false)]
+    public bool ShowAdvanced { get; set; } = true;
 
     /// <summary>Last file/folder picked through a browse dialog, shared by every pane.</summary>
     public static string LastBrowsedPath { get; set; } = string.Empty;
@@ -132,6 +145,7 @@ public sealed class OperationsPane : UserControl
         _fields.SuspendLayout();
         _fields.Controls.Clear();
         _fieldControls.Clear();
+        _autoOutput = null;
         var rows = new List<Control>();
         if (command.Fields.Length == 0)
         {
@@ -148,11 +162,23 @@ public sealed class OperationsPane : UserControl
 
         foreach (CommandField field in command.Fields)
         {
-            int height = field.Kind == FieldKind.MultiText ? 92 : 32;
-            var row = new TableLayoutPanel { Dock = DockStyle.Top, Height = height, ColumnCount = 2, RowCount = 1 };
+            if (field.AdvancedOnly && !ShowAdvanced)
+                continue;
+            bool hasHint = !string.IsNullOrWhiteSpace(field.Hint);
+            int inputHeight = field.Kind == FieldKind.MultiText ? 92 : 30;
+
+            var row = new TableLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                ColumnCount = 2,
+                RowCount = 1,
+                Margin = new Padding(0, 0, 0, 2),
+            };
             row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 180));
             row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            row.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            row.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             row.Controls.Add(new Label
             {
                 Text = field.Label,
@@ -160,10 +186,42 @@ public sealed class OperationsPane : UserControl
                 TextAlign = ContentAlignment.MiddleLeft,
                 Padding = new Padding(0, 0, 8, 0),
             }, 0, 0);
+
+            // The guidance is a visible hint line under the input, not placeholder text, so an empty
+            // optional box is never confused with "showing a default that will actually be sent".
+            var cell = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                ColumnCount = 1,
+                RowCount = hasHint ? 2 : 1,
+                Margin = new Padding(0),
+            };
+            cell.RowStyles.Add(new RowStyle(SizeType.Absolute, inputHeight));
             Control input = MakeInput(field);
             input.Dock = DockStyle.Fill;
             _fieldControls[field.Id] = input;
-            row.Controls.Add(input, 1, 0);
+            cell.Controls.Add(input, 0, 0);
+            if (hasHint)
+            {
+                cell.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                var hint = new Label
+                {
+                    Text = field.Hint,
+                    AutoSize = false,
+                    Dock = DockStyle.Fill,
+                    Height = 16,
+                    ForeColor = Color.DimGray,
+                    AutoEllipsis = true,
+                    TextAlign = ContentAlignment.MiddleLeft,
+                    Padding = new Padding(0, 0, 4, 0),
+                };
+                _tips.SetToolTip(hint, field.Hint);
+                cell.Controls.Add(hint, 0, 1);
+            }
+
+            row.Controls.Add(cell, 1, 0);
             rows.Add(row);
         }
         for (int index = rows.Count - 1; index >= 0; index--)
@@ -171,34 +229,59 @@ public sealed class OperationsPane : UserControl
         _fields.ResumeLayout(true);
     }
 
-    private Control MakeInput(CommandField field) => field.Kind switch
+    private Control MakeInput(CommandField field)
     {
-        FieldKind.File => MakePathInput(field, PathInputMode.OpenFile),
-        FieldKind.SaveFile => MakePathInput(field, PathInputMode.SaveFile),
-        FieldKind.Folder => MakePathInput(field, PathInputMode.Folder),
-        FieldKind.Combo => MakeCombo(field),
-        FieldKind.Check => new CheckBox
+        string @default = field.DefaultFor(ShowAdvanced);
+        return field.Kind switch
         {
-            Text = field.Hint,
-            Checked = field.Default == "1",
-            AutoSize = true,
-            Padding = new Padding(0, 5, 0, 0),
-        },
-        FieldKind.MultiText => new TextBox
-        {
-            Multiline = true,
-            ScrollBars = ScrollBars.Vertical,
-            AcceptsReturn = true,
-            Text = field.Default,
-            PlaceholderText = field.Hint,
-            Font = new Font("Cascadia Mono", 9f),
-        },
-        FieldKind.Numeric => MakeNumeric(field),
-        FieldKind.Slider => MakeSlider(field),
-        _ => new TextBox { Text = field.Default, PlaceholderText = field.Hint },
-    };
+            FieldKind.File => MakePathInput(field, PathInputMode.OpenFile),
+            FieldKind.SaveFile => MakePathInput(field, PathInputMode.SaveFile),
+            FieldKind.Folder => MakePathInput(field, PathInputMode.Folder),
+            FieldKind.Combo => MakeCombo(field, @default),
+            FieldKind.Check => new CheckBox
+            {
+                Text = field.Hint,
+                Checked = @default == "1",
+                AutoSize = true,
+                Padding = new Padding(0, 5, 0, 0),
+            },
+            FieldKind.MultiText => new TextBox
+            {
+                Multiline = true,
+                ScrollBars = ScrollBars.Vertical,
+                AcceptsReturn = true,
+                Text = @default,
+                Font = new Font("Cascadia Mono", 9f),
+            },
+            FieldKind.Numeric => MakeNumeric(field, @default),
+            FieldKind.Slider => MakeSlider(field, @default),
+            _ => MakeTextInput(field, @default),
+        };
+    }
 
-    private static Control MakeNumeric(CommandField field)
+    /// <summary>
+    /// A plain text input. The title id is special: editing it keeps the content id's embedded
+    /// 9-character title segment consistent, because the console derives the title id from it.
+    /// </summary>
+    private Control MakeTextInput(CommandField field, string @default)
+    {
+        var box = new TextBox { Text = @default };
+        if (field.Id == "titleId")
+        {
+            box.TextChanged += (_, _) =>
+            {
+                string titleId = box.Text.Trim();
+                if (titleId.Length != 9)
+                    return;
+                if (_fieldControls.TryGetValue("contentId", out Control? control) &&
+                    TextBoxOf(control) is { } content && content.Text.Trim() is { Length: 36 } text)
+                    content.Text = string.Concat(text.AsSpan(0, 7), titleId, text.AsSpan(16));
+            };
+        }
+        return box;
+    }
+
+    private static Control MakeNumeric(CommandField field, string @default)
     {
         var numeric = new NumericUpDown
         {
@@ -207,15 +290,15 @@ public sealed class OperationsPane : UserControl
             Increment = field.Increment,
             TextAlign = HorizontalAlignment.Left,
         };
-        numeric.Value = int.TryParse(field.Default, out int value)
+        numeric.Value = int.TryParse(@default, out int value)
             ? Math.Clamp(value, field.Minimum, field.Maximum)
             : Math.Clamp(0, field.Minimum, field.Maximum);
         return numeric;
     }
 
-    private static Control MakeSlider(CommandField field)
+    private static Control MakeSlider(CommandField field, string @default)
     {
-        int initial = int.TryParse(field.Default, out int value)
+        int initial = int.TryParse(@default, out int value)
             ? Math.Clamp(value, field.Minimum, field.Maximum)
             : field.Minimum;
         var panel = new TableLayoutPanel { ColumnCount = 2, RowCount = 1, Margin = new Padding(0) };
@@ -246,7 +329,7 @@ public sealed class OperationsPane : UserControl
         return panel;
     }
 
-    private static Control MakeCombo(CommandField field)
+    private static Control MakeCombo(CommandField field, string @default)
     {
         var combo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
         for (int index = 0; index < field.Choices.Length; index++)
@@ -256,7 +339,7 @@ public sealed class OperationsPane : UserControl
         }
         if (combo.Items.Count > 0)
         {
-            int selected = Array.IndexOf(field.Choices, field.Default);
+            int selected = Array.IndexOf(field.Choices, @default);
             combo.SelectedIndex = selected >= 0 ? selected : 0;
         }
         return combo;
@@ -268,7 +351,7 @@ public sealed class OperationsPane : UserControl
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 32));
         panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        var box = new TextBox { Dock = DockStyle.Fill, Text = field.Default, PlaceholderText = field.Hint };
+        var box = new TextBox { Dock = DockStyle.Fill, Text = field.DefaultFor(ShowAdvanced) };
         var browse = new Button { Dock = DockStyle.Fill, Text = "..." };
         browse.Click += (_, _) => BrowsePath(box, field, mode);
         panel.Controls.Add(box, 0, 0);
@@ -294,6 +377,7 @@ public sealed class OperationsPane : UserControl
             {
                 box.Text = dialog.SelectedPath;
                 LastBrowsedPath = dialog.SelectedPath;
+                AutoFillFromInput(field, dialog.SelectedPath);
             }
             return;
         }
@@ -305,15 +389,125 @@ public sealed class OperationsPane : UserControl
             string startDirectory = ResolveStartDirectory(current);
             if (startDirectory.Length > 0)
                 fileDialog.InitialDirectory = startDirectory;
-            if (current.Length > 0 && File.Exists(current))
-                fileDialog.FileName = current;
+            if (current.Length > 0)
+            {
+                // Pre-fill the file name so a Save dialog opens with the derived name (e.g. <folder>.pkg).
+                fileDialog.FileName = File.Exists(current) ? current : Path.GetFileName(current);
+            }
             if (fileDialog.ShowDialog(FindForm()) == DialogResult.OK)
             {
                 box.Text = fileDialog.FileName;
                 LastBrowsedPath = fileDialog.FileName;
+                _autoOutput = null; // a hand-picked output is authoritative
+                AutoFillFromInput(field, fileDialog.FileName);
             }
         }
     }
+
+    /// <summary>
+    /// After an input path is picked, derives the output path and auto-fills the identity fields
+    /// (content id, title id, title) from the source tree's <c>sce_sys/param.json</c>. Only the
+    /// output is conditional (empty box); the identity fields are always refreshed from the pick.
+    /// </summary>
+    private void AutoFillFromInput(CommandField field, string path)
+    {
+        if (_current is null || field.Kind is not (FieldKind.Folder or FieldKind.File))
+            return;
+
+        string? directory = Directory.Exists(path) ? path
+            : File.Exists(path) ? Path.GetDirectoryName(path) : null;
+        if (string.IsNullOrEmpty(directory))
+            return;
+
+        // 1. Output "<parent>\<name>.pkg" from the selected folder name. Updated whenever the input is
+        // re-picked, as long as the output is still empty or still holds the previous auto value
+        // (a hand-edited output is left alone).
+        if (_fieldControls.TryGetValue("out", out Control? outControl) && TextBoxOf(outControl) is { } output)
+        {
+            string current = output.Text.Trim();
+            bool mayReplace = current.Length == 0 ||
+                (_autoOutput is not null && string.Equals(current, _autoOutput, StringComparison.OrdinalIgnoreCase));
+            var info = new DirectoryInfo(directory);
+            if (mayReplace && info.Name.Length > 0)
+            {
+                output.Text = Path.Combine(info.Parent?.FullName ?? directory, info.Name + ".pkg");
+                _autoOutput = output.Text;
+            }
+        }
+
+        // 2. Identity from sce_sys/param.json (the folder itself, or one nested level).
+        string? paramJson = FindParamJson(directory);
+        if (paramJson is null)
+            return;
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(File.ReadAllText(paramJson));
+            JsonElement root = document.RootElement;
+            SetFieldValue("contentId", GetString(root, "contentId"));
+            SetFieldValue("titleId", GetString(root, "titleId"));
+            SetFieldValue("title", ReadTitle(root));
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+        {
+            // A missing or malformed param.json leaves the identity fields untouched.
+        }
+    }
+
+    private static string? FindParamJson(string directory)
+    {
+        string direct = Path.Combine(directory, "sce_sys", "param.json");
+        if (File.Exists(direct))
+            return direct;
+        try
+        {
+            foreach (string child in Directory.EnumerateDirectories(directory))
+            {
+                string nested = Path.Combine(child, "sce_sys", "param.json");
+                if (File.Exists(nested))
+                    return nested;
+            }
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+        return null;
+    }
+
+    private static string? GetString(JsonElement root, string name) =>
+        root.ValueKind == JsonValueKind.Object && root.TryGetProperty(name, out JsonElement value) &&
+        value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    private static string? ReadTitle(JsonElement root)
+    {
+        string? title = null;
+        if (root.ValueKind == JsonValueKind.Object &&
+            root.TryGetProperty("localizedParameters", out JsonElement locals) &&
+            locals.ValueKind == JsonValueKind.Object)
+        {
+            if (locals.TryGetProperty("default", out JsonElement def))
+                title = GetString(def, "titleName");
+            if (string.IsNullOrEmpty(title) && locals.TryGetProperty("en-US", out JsonElement en))
+                title = GetString(en, "titleName");
+        }
+        return string.IsNullOrEmpty(title) ? GetString(root, "titleName") : title;
+    }
+
+    private void SetFieldValue(string id, string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return;
+        if (_fieldControls.TryGetValue(id, out Control? control) && TextBoxOf(control) is { } box)
+            box.Text = value;
+    }
+
+    /// <summary>Unwraps the TextBox from a path field (a TableLayoutPanel) or a plain text field.</summary>
+    private static TextBox? TextBoxOf(Control? control) => control switch
+    {
+        TextBox box => box,
+        TableLayoutPanel panel => panel.Controls.OfType<TextBox>().FirstOrDefault(),
+        _ => null,
+    };
 
     private static string ResolveStartDirectory(string current)
     {
@@ -321,6 +515,10 @@ public sealed class OperationsPane : UserControl
             return Path.GetDirectoryName(current) ?? string.Empty;
         if (Directory.Exists(current))
             return current;
+        // A not-yet-existing output path: start in its directory so the Save dialog opens there.
+        string? parent = Path.GetDirectoryName(current);
+        if (!string.IsNullOrEmpty(parent) && Directory.Exists(parent))
+            return parent;
         if (File.Exists(LastBrowsedPath))
             return Path.GetDirectoryName(LastBrowsedPath) ?? string.Empty;
         return Directory.Exists(LastBrowsedPath) ? LastBrowsedPath : string.Empty;
@@ -330,10 +528,10 @@ public sealed class OperationsPane : UserControl
     {
         if (_current is null)
             return;
-        var values = new Dictionary<string, string>(StringComparer.Ordinal);
+        var rendered = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach ((string id, Control control) in _fieldControls)
         {
-            values[id] = control switch
+            rendered[id] = control switch
             {
                 TextBox text => text.Text.Trim(),
                 ComboBox combo => ExtractComboValue(combo.SelectedItem?.ToString() ?? string.Empty),
@@ -345,7 +543,7 @@ public sealed class OperationsPane : UserControl
                 _ => string.Empty,
             };
         }
-        RunRequested?.Invoke(_current, values);
+        RunRequested?.Invoke(_current, CommandValues.Merge(_current, rendered, ShowAdvanced));
     }
 
     private static string ExtractComboValue(string value)

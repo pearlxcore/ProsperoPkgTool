@@ -11,6 +11,9 @@ public sealed class MainForm : Form
     private readonly PackageBar _packageBar = new();
     private readonly OperationsPane _packageOperations = new();
     private readonly OperationsPane _toolOperations = new();
+    private readonly OperationsPane _convertEasy = new() { ShowAdvanced = false };
+    private readonly OperationsPane _convertAdvanced = new();
+    private readonly TabControl _convertTabs = new() { Dock = DockStyle.Fill };
     private readonly OutputConsole _output = new();
     private readonly TabControl _operationTabs = new() { Dock = DockStyle.Fill };
     private readonly SplitContainer _outputSplit = new()
@@ -48,6 +51,8 @@ public sealed class MainForm : Form
 
         _packageOperations.SetCommands(CommandRegistry.PackageOperations);
         _toolOperations.SetCommands(CommandRegistry.ToolOperations);
+        _convertEasy.SetCommands(CommandRegistry.ConvertOperations);
+        _convertAdvanced.SetCommands(CommandRegistry.ConvertOperations);
 
         BuildLayout();
         WireEvents();
@@ -58,10 +63,25 @@ public sealed class MainForm : Form
     internal void SelectOperationTab(int index) =>
         _operationTabs.SelectedIndex = Math.Clamp(index, 0, _operationTabs.TabPages.Count - 1);
 
+    /// <summary>Maps the visible top-level/nested tab to the pane that F5 (Run) targets.</summary>
+    private void UpdateActivePane()
+    {
+        _activePane = _operationTabs.SelectedIndex switch
+        {
+            1 => _toolOperations,
+            2 => _convertTabs.SelectedIndex == 0 ? _convertEasy : _convertAdvanced,
+            _ => _packageOperations,
+        };
+    }
+
     private void BuildLayout()
     {
+        _convertTabs.TabPages.Add(CreateTab("Easy", _convertEasy));
+        _convertTabs.TabPages.Add(CreateTab("Advanced", _convertAdvanced));
+
         _operationTabs.TabPages.Add(CreateTab("Package", _packageOperations));
         _operationTabs.TabPages.Add(CreateTab("Build & Tools", _toolOperations));
+        _operationTabs.TabPages.Add(CreateTab("Convert", _convertTabs));
         _outputSplit.Panel1.Controls.Add(_operationTabs);
         _outputSplit.Panel2.Controls.Add(_output);
 
@@ -102,7 +122,7 @@ public sealed class MainForm : Form
 
     private void WireEvents()
     {
-        foreach (OperationsPane pane in new[] { _packageOperations, _toolOperations })
+        foreach (OperationsPane pane in new[] { _packageOperations, _toolOperations, _convertEasy, _convertAdvanced })
         {
             pane.RunRequested += async (command, values) => await RunOperationAsync(command, values);
             pane.CancelRequested += CancelOperation;
@@ -112,10 +132,8 @@ public sealed class MainForm : Form
                     _operationStatus.Text = command.Title;
             };
         }
-        _operationTabs.SelectedIndexChanged += (_, _) =>
-        {
-            _activePane = _operationTabs.SelectedIndex == 1 ? _toolOperations : _packageOperations;
-        };
+        _operationTabs.SelectedIndexChanged += (_, _) => UpdateActivePane();
+        _convertTabs.SelectedIndexChanged += (_, _) => UpdateActivePane();
         _output.CancelRequested += CancelOperation;
         _packageBar.PackageChanged += (_, _) =>
         {
@@ -334,7 +352,8 @@ public sealed class MainForm : Form
                     case "recent": _packageBar.AddRecent(value); break;
                     case "width" when int.TryParse(value, out int width): Width = Math.Max(MinimumSize.Width, width); break;
                     case "height" when int.TryParse(value, out int height): Height = Math.Max(MinimumSize.Height, height); break;
-                    case "tab" when int.TryParse(value, out int tab): _operationTabs.SelectedIndex = Math.Clamp(tab, 0, 1); break;
+                    case "tab" when int.TryParse(value, out int tab): _operationTabs.SelectedIndex = Math.Clamp(tab, 0, _operationTabs.TabPages.Count - 1); break;
+                    case "convertTab" when int.TryParse(value, out int convertTab): _convertTabs.SelectedIndex = Math.Clamp(convertTab, 0, 1); break;
                     case "browse": OperationsPane.LastBrowsedPath = value; break;
                     case "outputSplitter" when int.TryParse(value, out int output): _savedOutputSplitter = output; break;
                     case "packageSplitter" when int.TryParse(value, out int package): _savedPackageSplitter = package; break;
@@ -393,6 +412,7 @@ public sealed class MainForm : Form
                 "width=" + Width,
                 "height=" + Height,
                 "tab=" + _operationTabs.SelectedIndex,
+                "convertTab=" + _convertTabs.SelectedIndex,
                 "browse=" + OperationsPane.LastBrowsedPath,
                 "outputSplitter=" + _outputSplit.SplitterDistance,
                 "packageSplitter=" + _packageOperations.Split.SplitterDistance,

@@ -53,8 +53,17 @@ public static class ProsperoPs5InnerImageReader
     /// </summary>
     public static IReadOnlyList<InnerBlock> WalkBlocks(
         ReadOnlySpan<byte> naps, long innerImageLength)
+        => NapsDialectRegistry.Select(naps, innerImageLength, null);
+
+    internal static IReadOnlyList<InnerBlock> WalkBlocksCore(
+        ReadOnlySpan<byte> naps, long innerImageLength, bool nativeSpans)
     {
         IReadOnlyList<NapsCblockInfoEntry> cb = DecodeCblockInfos(naps);
+        if (nativeSpans && (cb.Any(e => !e.IsRunBase && ((e.Raw[8] & 8) != 0 || e.KdePredictor != 0)) ||
+            cb.Count < 3 || !cb[0].IsRunBase || cb[^1].IsRunBase || cb[^1].Even != 0 || cb[^1].Odd != 0))
+            throw new InvalidDataException("Native span layout requires unmarked KDE=0 records, an initial RUN and a terminator.");
+        if (nativeSpans && cb.Zip(cb.Skip(1)).Any(pair => pair.First.IsRunBase && pair.Second.IsRunBase))
+            throw new InvalidDataException("Consecutive NAPS RUN records have no STD span.");
 
         var stds = new List<(NapsCblockInfoEntry Entry, NapsCblockInfoEntry? Run, int RunIndex, int EntryIndex, uint EndCoffMod)>();
         NapsCblockInfoEntry? activeRun = null;
@@ -85,7 +94,7 @@ public static class ProsperoPs5InnerImageReader
         // offset below 256 KiB, so both its own heuristic and the absence of any high RUN page
         // distinguish it from a modern data-first layout (which re-bases the compressed cursor at
         // RUN.CoffsetStart256K, including reference-writer packages that omit our private marker).
-        bool legacyLayout = ProsperoNapsLayout.DecodeHeader(naps).CompressionType != 0 &&
+        bool legacyLayout = !nativeSpans && ProsperoNapsLayout.DecodeHeader(naps).CompressionType != 0 &&
             !stds.Any(s => (s.Entry.Raw[8] & 0x08) != 0) &&
             !stds.Any(s => s.Run is { CoffsetStart256K: > 0 });
 
@@ -133,6 +142,13 @@ public static class ProsperoPs5InnerImageReader
             // stored block wraps its modulo Coffset to zero, so derive its stream size from its
             // logical size rather than treating it as a dedup alias.
             bool stored = (curr.Raw[8] & 0x08) != 0 && !zeroHole;
+            // Observed in 1.2.0 binary output: a full stored span wraps the 18-bit delta
+            // to zero. The raw selectors and full even chunk distinguish it from an alias.
+            if (nativeSpans && !zeroHole && curr.Even == 1 &&
+                curr.Odd == (uncompressed > Chunk128K ? 1 : 0) &&
+                evenComp == Math.Min(uncompressed, Chunk128K) &&
+                totalComp == (uncompressed & Mod256K))
+                stored = true;
             if (stored)
                 totalComp = uncompressed;
             // Legacy debug layouts also use KDE=0 short/zero streams for sparse aliases. This
@@ -144,9 +160,37 @@ public static class ProsperoPs5InnerImageReader
                 ? !zeroHole && (totalComp == 0 || (curr.KdePredictor == 0 && curr.Even == 1 && curr.Odd == 1 && totalComp < uncompressed))
                 : !stored && !zeroHole && totalComp == 0;
             bool kraken = !stored && !isDedup && !zeroHole && totalComp < uncompressed;
+            if (nativeSpans)
+            {
+                if ((sourceCursor & Mod256K) != curr.CoffsetStartMod256K)
+                    throw new InvalidDataException($"NAPS source cursor disagrees with STD record {stds[i].EntryIndex}.");
+                if (stds[i].Run is null || (stds[i].EntryIndex > 0 && cb[stds[i].EntryIndex - 1].IsRunBase &&
+                    cb[stds[i].EntryIndex - 1].KeyTableIdx != 0))
+                    throw new InvalidDataException($"Unsupported NAPS RUN at record {stds[i].EntryIndex}.");
+                if (!isDedup && (sourceCursor < 0 || sourceCursor > innerImageLength || totalComp > innerImageLength - sourceCursor))
+                    throw new InvalidDataException($"NAPS source outside image at record {stds[i].EntryIndex}.");
+                if (!zeroHole && !isDedup && !stored && !kraken)
+                    throw new InvalidDataException($"Invalid native stored span at record {stds[i].EntryIndex}.");
+                if (kraken && (totalComp <= 0 || evenComp > totalComp ||
+                    (uncompressed > Chunk128K && evenComp == totalComp)))
+                    throw new InvalidDataException($"Invalid compressed range at record {stds[i].EntryIndex}.");
+            }
             int owner = -1;
             if (isDedup)
-                sourceOwners.TryGetValue(sourceCursor, out owner);
+            {
+                if (!sourceOwners.TryGetValue(sourceCursor, out owner)) owner = -1;
+                // A dedup block must resolve to an existing source block at the same compressed
+                // offset. Without this guard a mod-256K compressed-cursor coincidence can alias an
+                // unrelated block (observed on a foreign layout where tens of thousands of blocks
+                // aliased to block 0), which silently returned the wrong bytes. Fail loudly instead.
+                // The legacy Sony traversal keys aliases differently, so it keeps its verified path.
+                if (!legacyLayout
+                    && (owner < 0 || owner >= result.Count || result[owner].CompressedOffset != sourceCursor))
+                    throw new InvalidDataException(
+                        $"NAPS dedup alias at logical 0x{absUoff:X} references compressed offset 0x{sourceCursor:X} with no matching source block.");
+                if (nativeSpans && result[owner].UncompressedLength < uncompressed)
+                    throw new InvalidDataException($"NAPS alias at logical 0x{absUoff:X} exceeds its source block.");
+            }
             int krakenFlags = kraken ? DeriveKrakenFlags(curr.Even, curr.Odd, uncompressed > Chunk128K) : 0;
             result.Add(new InnerBlock(
                 sourceCursor, totalComp, evenComp,
@@ -156,10 +200,13 @@ public static class ProsperoPs5InnerImageReader
                 sourceOwners[sourceCursor] = result.Count - 1;
 
             absUoff += uncompressed;
-            if (!zeroHole && !isDedup)
+            if ((!zeroHole || nativeSpans) && !isDedup)
                 sourceCursor += totalComp;
         }
 
+        if (nativeSpans && (absUoff <= (ProsperoNapsLayout.DecodeHeader(naps).NumUBlocks - 1L) * Ublock256K ||
+            absUoff > (long)ProsperoNapsLayout.DecodeHeader(naps).NumUBlocks * Ublock256K))
+            throw new InvalidDataException("Native span logical coverage disagrees with the NAPS ublock count.");
         return result;
     }
 
@@ -174,13 +221,15 @@ public static class ProsperoPs5InnerImageReader
         NapsLayoutCounts counts = ProsperoNapsLayout.DecodeHeader(naps);
         long cbiBase = ProsperoNapsLayout.ComputeCblockInfoBase(naps);
         int count = counts.NumCblockInfo;
+        if (cbiBase < 0 || cbiBase > naps.Length || (long)count * 9 > naps.Length - cbiBase)
+            throw new InvalidDataException($"Truncated NAPS CblockInfo table: declared {count} records at 0x{cbiBase:X}.");
 
         var entries = new List<NapsCblockInfoEntry>(count);
         for (int i = 0; i < count; i++)
         {
             long byteOffset = cbiBase + ((long)i * 72) / 8;
             if (byteOffset + 9 > naps.Length)
-                break;
+                throw new InvalidDataException($"Truncated NAPS CblockInfo record {i} of {count}.");
             entries.Add(ProsperoNapsLayout.DecodeCblockInfoEntry(naps.Slice((int)byteOffset, 9)));
         }
         return entries;
@@ -198,7 +247,14 @@ public static class ProsperoPs5InnerImageReader
         ArgumentNullException.ThrowIfNull(innerImage);
         ArgumentNullException.ThrowIfNull(naps);
 
-        IReadOnlyList<InnerBlock> blocks = WalkBlocks(naps, innerImage.Length);
+        IReadOnlyList<InnerBlock> blocks = NapsDialectRegistry.Select(naps, innerImage.Length,
+            candidate => NapsDialectRegistry.ProbePfs(candidate, innerImage.Length,
+                (offset, length) => innerImage.AsSpan(checked((int)offset), length).ToArray()));
+        return ReconstructMount(innerImage, blocks);
+    }
+
+    internal static byte[] ReconstructMount(byte[] innerImage, IReadOnlyList<InnerBlock> blocks)
+    {
 
         // Mount size = highest uncompressed boundary, 64K-aligned.
         long mountSize = 0;
@@ -322,19 +378,36 @@ public static class ProsperoPs5InnerImageReader
                 $"Kraken NAPS block at logical 0x{b.UncompressedOffset:X} has invalid source range 0x{b.CompressedOffset:X}+0x{b.CompressedLength:X}.");
 
         byte[] compressed = readInnerImage(b.CompressedOffset, b.CompressedLength);
-        bool multiChunk = length > Chunk128K;
-        int firstChunkComp = multiChunk ? b.EvenCompressedLength : 0;
-        foreach (int flags in FlagCandidates(multiChunk, b.KrakenFlags))
-        {
-            KrakenDecoder.KrakenDecodeStatus status;
-            try { status = KrakenDecoder.DecodeBlock(compressed, flags, firstChunkComp, buffer); }
-            catch { continue; }
-            if (status == KrakenDecoder.KrakenDecodeStatus.Success)
-                return buffer;
-        }
-        throw new InvalidDataException(
-            $"Kraken decode failed for NAPS block at logical 0x{b.UncompressedOffset:X}, source 0x{b.CompressedOffset:X}+0x{b.CompressedLength:X}, KDE unknown.");
+        DecodeKrakenDeterministic(compressed, b, buffer);
+        return buffer;
     }
+
+    /// <summary>
+    /// Decode one Kraken block using the codec flags derived deterministically from the NAPS
+    /// <c>Even</c>/<c>Odd</c> selectors (the same bit mapping the reference decoder uses). There is
+    /// intentionally no candidate search: a failure is surfaced as a decode error carrying the
+    /// selector and decoder status, so a wrong-but-successful guess cannot pass silently and a real
+    /// decode failure is never hidden.
+    /// </summary>
+    private static void DecodeKrakenDeterministic(ReadOnlySpan<byte> compressed, InnerBlock b, Span<byte> destination)
+    {
+        bool multiChunk = b.UncompressedLength > Chunk128K;
+        int firstChunkComp = multiChunk ? b.EvenCompressedLength : 0;
+        KrakenDecoder.KrakenDecodeStatus status;
+        try
+        {
+            status = KrakenDecoder.DecodeBlock(compressed, b.KrakenFlags, firstChunkComp, destination);
+        }
+        catch (Exception ex) when (ex is InvalidDataException or ArgumentException or IndexOutOfRangeException)
+        {
+            throw new InvalidDataException(KrakenFailure(b, $"threw {ex.GetType().Name}, flags 0x{b.KrakenFlags:X2}"), ex);
+        }
+        if (status != KrakenDecoder.KrakenDecodeStatus.Success)
+            throw new InvalidDataException(KrakenFailure(b, $"status {status}, flags 0x{b.KrakenFlags:X2}"));
+    }
+
+    private static string KrakenFailure(InnerBlock b, string detail) =>
+        $"Kraken decode failed for NAPS block at logical 0x{b.UncompressedOffset:X}, source 0x{b.CompressedOffset:X}+0x{b.CompressedLength:X} ({detail}).";
 
     /// <summary>
     /// Decode every block and discard the bytes, validating that all stored/Kraken/alias blocks
@@ -414,18 +487,7 @@ public static class ProsperoPs5InnerImageReader
 
             byte[] compressed = readInnerImage(b.CompressedOffset, b.CompressedLength);
             byte[] decoded = new byte[b.UncompressedLength];
-            bool multiChunk = b.UncompressedLength > Chunk128K;
-            int firstChunkComp = multiChunk ? b.EvenCompressedLength : 0;
-            bool ok = false;
-            foreach (int flags in FlagCandidates(multiChunk, b.KrakenFlags))
-            {
-                KrakenDecoder.KrakenDecodeStatus st;
-                try { st = KrakenDecoder.DecodeBlock(compressed, flags, firstChunkComp, decoded); }
-                catch { continue; }
-                if (st == KrakenDecoder.KrakenDecodeStatus.Success) { ok = true; break; }
-            }
-            if (!ok)
-                throw new InvalidDataException($"Kraken decode failed for NAPS block at logical 0x{b.UncompressedOffset:X}, source 0x{b.CompressedOffset:X}+0x{b.CompressedLength:X}, KDE unknown.");
+            DecodeKrakenDeterministic(compressed, b, decoded);
             destination.Position = b.UncompressedOffset;
             destination.Write(decoded, 0, room);
         }
@@ -453,18 +515,7 @@ public static class ProsperoPs5InnerImageReader
         ReadOnlySpan<byte> src = innerImage.AsSpan(
             (int)b.CompressedOffset, b.CompressedLength);
         Span<byte> dst = mount.AsSpan((int)b.UncompressedOffset, b.UncompressedLength);
-        bool multiChunk = b.UncompressedLength > Chunk128K;
-        int firstChunkComp = multiChunk ? b.EvenCompressedLength : 0;
-
-        foreach (int flags in FlagCandidates(multiChunk, b.KrakenFlags))
-        {
-            KrakenDecoder.KrakenDecodeStatus st;
-            try { st = KrakenDecoder.DecodeBlock(src, flags, firstChunkComp, dst); }
-            catch { continue; }
-            if (st == KrakenDecoder.KrakenDecodeStatus.Success)
-                return;
-        }
-        throw new InvalidDataException($"Kraken decode failed for NAPS block at logical 0x{b.UncompressedOffset:X}, source 0x{b.CompressedOffset:X}+0x{b.CompressedLength:X}, KDE unknown.");
+        DecodeKrakenDeterministic(src, b, dst);
     }
 
     /// <summary>
@@ -485,19 +536,6 @@ public static class ProsperoPs5InnerImageReader
             if ((odd & 2) != 0) flags |= 0x10;
         }
         return flags;
-    }
-
-    private static int[] FlagCandidates(bool multiChunk, int derived)
-    {
-        int[] baseList = multiChunk
-            ? [0x22, 0x02, 0x12, 0x32, 0x23, 0x03, 0x13, 0x33, 0x00, 0x20]
-            : [0x02, 0x00, 0x03, 0x01];
-        if (baseList[0] == derived)
-            return baseList;
-        var list = new List<int>(baseList.Length + 1) { derived };
-        foreach (int f in baseList)
-            if (f != derived) list.Add(f);
-        return list.ToArray();
     }
 
     /// <summary>

@@ -13,6 +13,7 @@ internal sealed class ConsoleProgress : IProgress<ProsperoBuildProgress>
     private string? _lastStage;
     private int _lastPercent = -1;
     private int _lastMilestone = -1;
+    private DateTime _lastEmitUtc = DateTime.UtcNow;
     private bool _wroteLine;
 
     public ConsoleProgress(bool enabled, ProsperoConsoleLog? log = null)
@@ -31,21 +32,34 @@ internal sealed class ConsoleProgress : IProgress<ProsperoBuildProgress>
 
     public void Report(ProsperoBuildProgress value)
     {
-        if (!_enabled || value.Total <= 0)
+        if (!_enabled)
             return;
         // Coarse stage boundaries (NAPS/CNT/Finalize report 1/1) are covered by the stage summary.
-        if (value.Total == 1)
+        if (value.Total <= 1 && value.BytesTotal <= 0)
             return;
-        int percent = (int)(100.0 * value.Done / value.Total);
-        // Whole-10% milestones only (always including completion); a captured stdout would otherwise
-        // get one line per file / per percent.
+
+        // Prefer a byte-accurate ratio when the stage supplies one (staging, inner image, outer PFS):
+        // a few multi-GB files would otherwise leave a file-count-only bar stuck for minutes.
+        bool byBytes = value.BytesTotal > 0;
+        double fraction = byBytes ? value.ByteFraction : value.Fraction;
+        int percent = (int)(100.0 * fraction);
+
         if (!string.Equals(value.Stage, _lastStage, StringComparison.Ordinal))
             _lastMilestone = -1;
-        int milestone = percent / 10;
-        if (milestone == _lastMilestone && percent < 100)
+
+        // Emit every 5% and at least every 30 seconds, so a long silent stretch is impossible.
+        int milestone = percent / 5;
+        bool due = milestone != _lastMilestone
+            || (DateTime.UtcNow - _lastEmitUtc).TotalSeconds >= 30;
+        if (!due)
             return;
         _lastMilestone = milestone;
-        Emit($"    {percent,3}%  {value.Stage} ({value.Done:N0}/{value.Total:N0})", value.Stage, percent);
+
+        string amount = byBytes
+            ? $"{value.BytesDone / 1048576.0:N0}/{value.BytesTotal / 1048576.0:N0} MiB"
+            : $"{value.Done:N0}/{value.Total:N0}";
+        string where = string.IsNullOrEmpty(value.CurrentPath) ? "" : $"  {value.CurrentPath}";
+        Emit($"    {percent,3}%  {value.Stage} ({amount}){where}", value.Stage, percent);
     }
 
     /// <summary>Reports extract progress as files completed out of a total.</summary>
@@ -59,6 +73,7 @@ internal sealed class ConsoleProgress : IProgress<ProsperoBuildProgress>
 
     private void Emit(string line, string stage, int percent)
     {
+        _lastEmitUtc = DateTime.UtcNow;
         if (_log is not null)
         {
             _log.Write(line);
