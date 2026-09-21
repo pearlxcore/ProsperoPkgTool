@@ -35,7 +35,7 @@ public static class ProsperoPfscReader
         long dataLength = BinaryPrimitives.ReadInt64LittleEndian(container[0x28..]);
 
         if (blockSize != ProsperoPfscWriter.BlockSize)
-            throw new InvalidDataException($"Unsupported PFSC block size {blockSize}.");
+            throw ProsperoErrorInfo.Unsupported($"Unsupported PFSC block size {blockSize}.");
         if (blockSize64 != blockSize)
             throw new InvalidDataException("PFSC block-size fields disagree.");
 

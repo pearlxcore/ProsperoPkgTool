@@ -25,6 +25,13 @@ public sealed class OuterPfsReader
     private const long SuperblockMagic = 20130315;       // little-endian i64 at offset 0x08
     private const ulong SignedSectorFlag = 0x800000000000UL;
 
+    /// <summary>
+    /// Seed marker written by community / plain builds that store the outer PFS unencrypted
+    /// (no AES-XTS and no authentication). When the superblock seed holds this value every block
+    /// is read verbatim instead of being XTS-decrypted.
+    /// </summary>
+    private static readonly byte[] PlainNoAuthSeed = "PPRPLAIN-NOAUTH!"u8.ToArray();
+
     // S32 inode layout (verified byte-exact against PPSA03530-bd-nw.pkg; FINDINGS.md §3.3).
     private const int S32InodeSize = 0x2C8;
     private const int S32DirectBlockOffset = 0x64;    // 12 x BlockSig32 (32 sig + 4 block) stride 36
@@ -43,6 +50,9 @@ public sealed class OuterPfsReader
     public byte[] Seed { get; }
     public byte[] Superblock { get; }
 
+    /// <summary>True when the outer PFS is stored unencrypted (community <c>PPRPLAIN-NOAUTH!</c> layout).</summary>
+    public bool IsPlainNoAuth { get; }
+
     private OuterPfsReader(Stream stream, long pfsOffset, long pfsSize, int superblockIndex, byte[] superblock, byte[] seed)
     {
         _stream = stream;
@@ -52,6 +62,7 @@ public sealed class OuterPfsReader
         BlockCount = (int)(pfsSize / BlockSize);
         Superblock = superblock;
         Seed = seed;
+        IsPlainNoAuth = seed.AsSpan().SequenceEqual(PlainNoAuthSeed);
     }
 
     /// <summary>
@@ -120,6 +131,11 @@ public sealed class OuterPfsReader
 
         if (blockIndex == SuperblockIndex)
             return raw; // superblock is plaintext
+
+        // Community / plain builds store the whole outer PFS unencrypted; the superblock seed is
+        // the literal PPRPLAIN-NOAUTH! marker, so no XTS key derivation or decryption applies.
+        if (IsPlainNoAuth)
+            return raw;
 
         ulong sector = signed ? ((ulong)(uint)blockIndex | SignedSectorFlag) : (ulong)(uint)blockIndex;
         return xts.Decrypt(raw, sector);
@@ -202,6 +218,9 @@ public sealed class OuterPfsReader
     /// </summary>
     public bool VerifySuperblockIcv()
     {
+        // A plain/no-auth outer PFS carries no authentication tag, so there is nothing to verify.
+        if (IsPlainNoAuth)
+            return true;
         byte[] region = Superblock.AsSpan(0, SuperblockIcvRegionLength).ToArray();
         Array.Clear(region, SuperblockIcvOffset, SuperblockIcvLength);
         byte[] computed = Sha3.Sha3_256(region);
@@ -293,8 +312,8 @@ public sealed class OuterPfsReader
             uroot.Size > (long)BlockCount * BlockSize || uroot.Blocks == 0 || uroot.Blocks > (uint)BlockCount)
         {
             throw new InvalidDataException(
-                "The outer PFS inode table did not decrypt to a valid uroot directory: the passcode is " +
-                "likely wrong, or the package is corrupt.");
+                "The outer PFS inode table did not yield a valid uroot directory: the passcode is wrong, " +
+                "the outer-PFS layout is unsupported, or the package is corrupt.");
         }
 
         return inodes;
@@ -335,7 +354,7 @@ public sealed class OuterPfsReader
         if (inode.Blocks > (uint)Math.Max(0, BlockCount))
             throw new InvalidDataException(
                 $"Outer inode declares {inode.Blocks} blocks, more than the image's {BlockCount} blocks: " +
-                "the passcode is likely wrong, or the package is corrupt.");
+                "the passcode is wrong, the outer-PFS layout is unsupported, or the package is corrupt.");
         int blocks = (int)inode.Blocks;
         if (blocks < 0)
             throw new InvalidDataException("Inode block count is negative.");
@@ -354,8 +373,8 @@ public sealed class OuterPfsReader
                 {
                     if (blockIndex < 0 || blockIndex >= BlockCount)
                         throw new InvalidDataException(
-                            "An outer inode references an out-of-range metadata block: the passcode is " +
-                            "likely wrong, or the package is corrupt.");
+                            "An outer inode references an out-of-range metadata block: the passcode is wrong, " +
+                            "the outer-PFS layout is unsupported, or the package is corrupt.");
                     return ReadBlock(xts, (int)blockIndex, signed: true);
                 }, result);
         }

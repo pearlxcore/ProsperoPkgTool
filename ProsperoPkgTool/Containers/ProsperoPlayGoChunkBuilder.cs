@@ -304,7 +304,7 @@ public static class ProsperoPlayGoChunkBuilder
     {
         if (project.Chunks.Count is < 1 or > byte.MaxValue || project.Scenarios.Count is < 1 or > ushort.MaxValue ||
             project.DefaultScenarioId < 0 || project.DefaultScenarioId >= project.Scenarios.Count)
-            throw new InvalidDataException("Unsupported debug/nwonly PlayGo project counts or default scenario.");
+            throw ProsperoErrorInfo.Unsupported("Unsupported debug/nwonly PlayGo project counts or default scenario.");
         RequireAscii(contentId, 128, "content ID");
         for (int i = 0; i < project.Chunks.Count; i++)
         {

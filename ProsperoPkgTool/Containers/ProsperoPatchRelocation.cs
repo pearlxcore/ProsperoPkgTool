@@ -25,7 +25,7 @@ public static class ProsperoPatchRelocation
         using var package = File.OpenRead(Path.GetFullPath(patchPath));
         ProsperoPackageSegment si = inspection.Segments.Single(segment => segment.Name == "SI");
         if (si.Size <= 0 || si.Size > int.MaxValue)
-            throw new InvalidDataException("Patch SI size is unsupported.");
+            throw ProsperoErrorInfo.Unsupported("Patch SI size is unsupported.");
         byte[] siBytes = new byte[checked((int)si.Size)];
         package.Position = si.Offset;
         package.ReadExactly(siBytes);

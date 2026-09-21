@@ -184,7 +184,7 @@ public static class ProsperoPackageReader
             throw new InvalidDataException("LIH FIH segment does not begin with FIH magic.");
         byte signedByte = fihPrefix[5];
         if (signedByte != 0x00)
-            throw new InvalidDataException($"Unsupported patch FIH signed byte 0x{signedByte:X2}; only observed debug patches are supported structurally.");
+            throw ProsperoErrorInfo.Unsupported($"Unsupported patch FIH signed byte 0x{signedByte:X2}; only observed debug patches are supported structurally.");
 
         var fih = new ProsperoFihHeader(
             signedByte,
@@ -228,7 +228,7 @@ public static class ProsperoPackageReader
         {
             0x00 => ProsperoPackageKind.FinalizedDebug,
             0x80 => ProsperoPackageKind.FinalizedRetail,
-            _ => throw new InvalidDataException($"Unsupported FIH signed byte 0x{signedByte:X2}.")
+            _ => throw ProsperoErrorInfo.Unsupported($"Unsupported FIH signed byte 0x{signedByte:X2}.")
         };
         var fih = new ProsperoFihHeader(
             signedByte,

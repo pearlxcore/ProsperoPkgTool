@@ -1,4 +1,5 @@
 using System.Globalization;
+using ProsperoPkgTool.Containers;
 
 namespace ProsperoPkgTool.Gp5;
 
@@ -29,7 +30,7 @@ public static class PlayGoProjectFactory
             if (!file.Chunk.HasValue)
                 continue;
             if (file.Chunk.Value is < 0 or > byte.MaxValue)
-                throw new InvalidDataException($"GP5 file '{file.DestinationPath}' has an unsupported chunk ID {file.Chunk}.");
+                throw ProsperoErrorInfo.Unsupported($"GP5 file '{file.DestinationPath}' has an unsupported chunk ID {file.Chunk}.");
             string path = NormalizePath(file.DestinationPath);
             if (!assignments.TryAdd(path, (byte)file.Chunk.Value))
                 throw new InvalidDataException($"GP5 assigns PlayGo chunk more than once to '{path}'.");

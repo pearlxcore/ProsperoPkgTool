@@ -166,7 +166,7 @@ public static class ProsperoPs5InnerImageReader
                     throw new InvalidDataException($"NAPS source cursor disagrees with STD record {stds[i].EntryIndex}.");
                 if (stds[i].Run is null || (stds[i].EntryIndex > 0 && cb[stds[i].EntryIndex - 1].IsRunBase &&
                     cb[stds[i].EntryIndex - 1].KeyTableIdx != 0))
-                    throw new InvalidDataException($"Unsupported NAPS RUN at record {stds[i].EntryIndex}.");
+                    throw ProsperoErrorInfo.Unsupported($"Unsupported NAPS RUN at record {stds[i].EntryIndex}.");
                 if (!isDedup && (sourceCursor < 0 || sourceCursor > innerImageLength || totalComp > innerImageLength - sourceCursor))
                     throw new InvalidDataException($"NAPS source outside image at record {stds[i].EntryIndex}.");
                 if (!zeroHole && !isDedup && !stored && !kraken)
@@ -569,7 +569,7 @@ public static class ProsperoPs5InnerImageReader
             if (item.Even == 0)
                 continue;
             if (activeRun is not { } run || run.KeyTableIdx != 0 || firstStdIndex < 0 || firstStdIndex >= document.CblockInfos.Count)
-                throw new InvalidDataException($"Unsupported or missing NAPS RUN before CblockInfo record {index}.");
+                throw ProsperoErrorInfo.Unsupported($"Unsupported or missing NAPS RUN before CblockInfo record {index}.");
 
             NapsCblockInfoEntry next = document.CblockInfos[index + 1];
             uint end = next.IsRunBase ? next.CoffsetEndMod256K : next.CoffsetStartMod256K;
@@ -657,7 +657,7 @@ public static class ProsperoPs5InnerImageReader
             1 => 0x00,        // bare entropy array
             4 or 5 => 0x02,   // newLZ, raw literals
             6 or 7 => 0x03,   // newLZ, sub/delta literals
-            _ => throw new InvalidDataException($"Unsupported Sony NAPS even codec selector {item.Even}.")
+            _ => throw ProsperoErrorInfo.Unsupported($"Unsupported Sony NAPS even codec selector {item.Even}.")
         };
         if (!multiChunk)
             return low;
@@ -666,7 +666,7 @@ public static class ProsperoPs5InnerImageReader
             1 => 0x00,
             4 or 5 => 0x20,   // newLZ, raw literals
             6 or 7 => 0x30,   // newLZ, sub/delta literals
-            _ => throw new InvalidDataException($"Unsupported Sony NAPS odd codec selector {item.Odd}.")
+            _ => throw ProsperoErrorInfo.Unsupported($"Unsupported Sony NAPS odd codec selector {item.Odd}.")
         };
         return low | high;
     }

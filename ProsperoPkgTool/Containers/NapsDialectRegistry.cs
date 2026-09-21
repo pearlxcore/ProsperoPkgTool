@@ -124,6 +124,6 @@ internal static class NapsDialectRegistry
         using var mount = new ProsperoInnerMountStream(blocks, sourceLength, ReadProbe);
         var entries = ProsperoInnerPfsReader.Enumerate(mount, superblockHint);
         if (!entries.Any(e => e.IsDirectory && e.Path == "/uroot"))
-            throw new InvalidDataException("NAPS metadata probe found no /uroot directory.");
+            throw ProsperoErrorInfo.Unsupported("NAPS metadata probe found no /uroot directory.");
     }
 }
