@@ -25,14 +25,14 @@ retail cross-checks are opt-in. No PS5 hardware install or launch has been demon
 
 "Verified" is only used with its scope stated:
 
-- **Structurally parsed** — FIH/CNT/LIH/PFS envelopes and ranges are read and bounds-checked.
-- **Internally round-tripped** — bytes written by this project are read back by this project (internal
+- **Structurally parsed** - FIH/CNT/LIH/PFS envelopes and ranges are read and bounds-checked.
+- **Internally round-tripped** - bytes written by this project are read back by this project (internal
   consistency, not independent proof).
-- **Fixture parity** — specific fields are byte-compared against a checked-in Sony-built debug package.
-- **Independently cross-validated** — a different implementation decodes the same artifact; requires the
+- **Fixture parity** - specific fields are byte-compared against a checked-in Sony-built debug package.
+- **Independently cross-validated** - a different implementation decodes the same artifact; requires the
   repaired oracle harness and is not currently reproducible in-tree.
-- **Cryptographically verified** — RSA/ECDSA signature verification is not implemented.
-- **Hardware tested** — not performed; no PS5 install/launch evidence exists.
+- **Cryptographically verified** - RSA/ECDSA signature verification is not implemented.
+- **Hardware tested** - not performed; no PS5 install/launch evidence exists.
 
 `img_verify` reports each check as `PASS` / `FAIL` / `UNAVAILABLE` / `UNSUPPORTED` / `ERROR` and an
 overall `PASSED` / `FAILED` / `INCOMPLETE` outcome. A missing key is `UNAVAILABLE`; a decode, crypto, or
