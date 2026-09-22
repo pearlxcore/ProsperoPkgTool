@@ -43,6 +43,14 @@ internal static class NapsDialectRegistry
     private static readonly INapsDialect[] Dialects =
         [new CoffsetDialect(false), new CoffsetDialect(true), new IndexedCoffsetDialect()];
 
+    /// <summary>
+    /// Dialects consulted only after every established dialect above has declined. Keeping them out
+    /// of <see cref="Dialects"/> makes the non-regression property structural rather than empirical:
+    /// a package that reads today produces a candidate before this list is ever reached, so it keeps
+    /// the exact dialect and the exact bytes it produced before these readers existed.
+    /// </summary>
+    private static readonly INapsDialect[] LastResortDialects = [new NapsSparseFidxDialect()];
+
     internal static NapsBlockPlan Select(ReadOnlySpan<byte> naps, long sourceLength,
         Action<IReadOnlyList<Block>>? probe)
     {
@@ -60,6 +68,21 @@ internal static class NapsDialectRegistry
                 candidates.Add((dialect.Id, blocks));
             }
             catch (InvalidDataException ex) { diagnostics.Add($"{dialect.Id}: {ex.Message}"); }
+        }
+        if (candidates.Count == 0)
+        {
+            foreach (var dialect in LastResortDialects)
+            {
+                try
+                {
+                    var blocks = dialect.Decode(naps, sourceLength);
+                    long end = blocks[^1].UncompressedOffset + blocks[^1].UncompressedLength;
+                    if (declaredEnd is { } expected && end != expected)
+                        throw new InvalidDataException($"Logical coverage {end} disagrees with the exact NAPS fidx mount end {expected}.");
+                    candidates.Add((dialect.Id, blocks));
+                }
+                catch (InvalidDataException ex) { diagnostics.Add($"{dialect.Id}: {ex.Message}"); }
+            }
         }
         if (candidates.Skip(1).Any(candidate => !Equivalent(candidates[0].Blocks, candidate.Blocks)))
         {
