@@ -37,15 +37,19 @@ public static class ProsperoInnerPfsReader
     {
         int super = FindSuperblock(mount);
         int inodeCount = CheckedInt(BinaryPrimitives.ReadInt64LittleEndian(mount.Slice(super + 0x30, 8)), "inode count");
-        long inodeTableEnd = super + BlockSize + (long)InodeBlockCount(inodeCount) * BlockSize;
-        if (inodeCount is < 1 or > 0x10000 || inodeTableEnd > mount.Length)
+        if (inodeCount < 1)
+            throw new InvalidDataException("Inner PFS inode count is invalid.");
+        // The mount size is the only real bound: a bogus inodeCount simply cannot fit, so no arbitrary
+        // ceiling is needed (any fixed cap would eventually reject a legitimate large title).
+        long inodeTableEnd = super + BlockSize + InodeBlockCount(inodeCount) * BlockSize;
+        if (inodeTableEnd > mount.Length)
             throw new InvalidDataException("Inner PFS inode table is outside the reconstructed mount.");
 
         var inodes = new Inode[inodeCount];
         for (int i = 0; i < inodes.Length; i++)
             inodes[i] = ReadInode(mount.Slice(InodeOffset(super, i), InodeSize));
 
-        repaired = RepairOrThrowTruncated(inodes, super, InodeBlockCount(inodeCount), mount.Length, repairTruncatedOffsets);
+        repaired = RepairOrThrowTruncated(inodes, super, (int)InodeBlockCount(inodeCount), mount.Length, repairTruncatedOffsets);
 
         var result = new List<Entry>();
         WalkDirectory(mount, inodes, 0, string.Empty, result, new HashSet<uint>());
@@ -89,11 +93,12 @@ public static class ProsperoInnerPfsReader
         long length = mount.Length;
         long super = FindSuperblock(mount, length, superblockHint);
         long inodeCountValue = ReadInt64(mount, super + 0x30);
-        if (inodeCountValue is < 1 or > 0x10000)
-            throw new InvalidDataException("Inner PFS inode table is outside the reconstructed mount.");
+        if (inodeCountValue is < 1 or > int.MaxValue)
+            throw new InvalidDataException("Inner PFS inode count is invalid.");
         int inodeCount = (int)inodeCountValue;
         long inodeTableOffset = super + BlockSize;
-        if (inodeTableOffset + (long)InodeBlockCount(inodeCount) * BlockSize > length)
+        // See the span overload: the mount size is the real bound, not a fixed inode ceiling.
+        if (inodeTableOffset + InodeBlockCount(inodeCount) * BlockSize > length)
             throw new InvalidDataException("Inner PFS inode table is outside the reconstructed mount.");
 
         var inodes = new Inode[inodeCount];
@@ -105,7 +110,7 @@ public static class ProsperoInnerPfsReader
             inodes[i] = ReadInode(inodeBytes);
         }
 
-        repaired = RepairOrThrowTruncated(inodes, super, InodeBlockCount(inodeCount), length, repairTruncatedOffsets);
+        repaired = RepairOrThrowTruncated(inodes, super, (int)InodeBlockCount(inodeCount), length, repairTruncatedOffsets);
 
         var result = new List<Entry>();
         WalkDirectory(mount, length, inodes, 0, string.Empty, result, new HashSet<uint>());
@@ -296,10 +301,10 @@ public static class ProsperoInnerPfsReader
         BinaryPrimitives.ReadInt64LittleEndian(source.Slice(8, 8)),
         BinaryPrimitives.ReadUInt64LittleEndian(source.Slice(0x60, 8)));
 
-    private static int InodeBlockCount(int inodeCount) => (inodeCount + InodesPerBlock - 1) / InodesPerBlock;
+    private static long InodeBlockCount(int inodeCount) => ((long)inodeCount + InodesPerBlock - 1) / InodesPerBlock;
 
     private static int InodeOffset(int superblock, int index)
-        => superblock + BlockSize + (index / InodesPerBlock) * BlockSize + (index % InodesPerBlock) * InodeSize;
+        => checked((int)(superblock + BlockSize + ((long)index / InodesPerBlock) * BlockSize + (long)(index % InodesPerBlock) * InodeSize));
 
     /// <summary>
     /// Handles packages whose 64-bit inode <c>DataOffset</c> was truncated to 32 bits. Every
