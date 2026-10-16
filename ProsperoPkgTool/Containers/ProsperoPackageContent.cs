@@ -23,7 +23,7 @@ public sealed record ProsperoDecodedPackage(
 /// </summary>
 public sealed class ProsperoFileBackedPackage : IDisposable
 {
-    private readonly FileStream _stream;
+    private readonly Stream _stream;
     private readonly AesXts _xts;
     private readonly Func<long, int, byte[]> _readRegion;
 
@@ -35,7 +35,7 @@ public sealed class ProsperoFileBackedPackage : IDisposable
         long mountLength,
         bool outerPfsIcvValid,
         IReadOnlyList<ProsperoInnerPfsReader.Entry> entries,
-        FileStream stream,
+        Stream stream,
         AesXts xts,
         Func<long, int, byte[]> readRegion)
     {
@@ -86,13 +86,15 @@ public static class ProsperoPackageContent
     /// dispose the result to release the package stream.
     /// </summary>
     public static ProsperoFileBackedPackage ReadFileBacked(string packagePath, string? passcode = null,
-        bool repairTruncatedOffsets = false)
+        bool repairTruncatedOffsets = false, string? referencePackagePath = null)
     {
         ProsperoPackageInspection inspection = ProsperoPackageReader.Read(packagePath);
         if (inspection.Fih is not { } fih)
             throw new InvalidDataException("The package has no finalized FIH/PFS payload.");
+        if (inspection.Kind == ProsperoPackageKind.FinalizedPatchDebug)
+            return ReadPatchFileBacked(packagePath, referencePackagePath, passcode, repairTruncatedOffsets, inspection);
         if (inspection.Kind != ProsperoPackageKind.FinalizedDebug)
-            throw new InvalidDataException("The file-backed reader supports finalized debug packages only.");
+            throw new InvalidDataException("The file-backed reader supports finalized debug and debug patch packages only.");
         if (inspection.Cnt.ContentId.Length != 36)
             throw new InvalidDataException("The package CNT has no usable content ID for outer-PFS key derivation.");
 
@@ -139,14 +141,115 @@ public static class ProsperoPackageContent
     }
 
     /// <summary>
+    /// File-backed reader for a finalized debug patch (LIH) package. The patched outer-PFS image is
+    /// served through <see cref="ProsperoPatchVirtualStream"/>, which resolves every 64 KiB block to
+    /// the reference or patch package through the SI relocation tables, so the reconstruction never
+    /// allocates the virtual image or the mount. From there the decode is identical to a base
+    /// package: outer superblock and NAPS from the virtual image, lazy inner mount on top.
+    /// </summary>
+    private static ProsperoFileBackedPackage ReadPatchFileBacked(string packagePath, string? referencePackagePath,
+        string? passcode, bool repairTruncatedOffsets, ProsperoPackageInspection inspection)
+    {
+        (_, ProsperoLihHeader lih) = ValidatePatchReference(packagePath, referencePackagePath, inspection);
+        if (inspection.Cnt.ContentId.Length != 36)
+            throw new InvalidDataException("The package CNT has no usable content ID for outer-PFS key derivation.");
+        ProsperoPatchRelocation.Tables tables = ProsperoPatchRelocation.Read(packagePath, inspection);
+        ProsperoPatchVirtualStream image = ProsperoPatchVirtualStream.Open(packagePath, referencePackagePath!, tables);
+        try
+        {
+            byte[] fihHeader = ReadPatchFihHeader(packagePath, lih);
+            OuterPfsReader pfs = OuterPfsReader.Open(image, 0, image.Length,
+                OuterSuperblockIndexHint(fihHeader, image.Length));
+            byte[] ekpfs = ProsperoKeys.ComputeEkpfs(inspection.Cnt.ContentId,
+                passcode ?? Gp5.Gp5Constants.DefaultPasscode);
+            (byte[] tweak, byte[] data) = ProsperoKeys.DeriveOuterPfsXtsKeys(ekpfs, pfs.Seed);
+            var xts = new AesXts(data, tweak);
+            try
+            {
+                byte[] naps = pfs.ReadNaps(xts);
+                long innerLength = pfs.InnerImageLength;
+                long innerHint = InnerSuperblockHint(fihHeader);
+                byte[] ReadRegion(long offset, int length) => pfs.ReadInnerImageRegion(xts, offset, length);
+                IReadOnlyList<ProsperoPs5InnerImageReader.InnerBlock> blocks =
+                    NapsDialectRegistry.Select(naps, innerLength, candidate =>
+                        NapsDialectRegistry.ProbePfs(candidate, innerLength, ReadRegion, innerHint));
+                long mountLength = ProsperoPs5InnerImageReader.MountSize(blocks);
+
+                IReadOnlyList<ProsperoInnerPfsReader.Entry> entries;
+                using (var mount = new ProsperoInnerMountStream(blocks, innerLength, ReadRegion))
+                    entries = ProsperoInnerPfsReader.Enumerate(mount, innerHint, repairTruncatedOffsets);
+
+                return new ProsperoFileBackedPackage(
+                    inspection, naps, blocks, innerLength, mountLength, pfs.VerifySuperblockIcv(), entries,
+                    image, xts, ReadRegion);
+            }
+            catch
+            {
+                xts.Dispose();
+                throw;
+            }
+        }
+        catch
+        {
+            image.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Check that <paramref name="referencePackagePath"/> is the finalized debug base the patch was
+    /// built against: same content ID, and the FIH reference digest the patch carries matches the
+    /// base's superblock digest. Returns the patch's FIH and LIH headers.
+    /// </summary>
+    private static (ProsperoFihHeader Fih, ProsperoLihHeader Lih) ValidatePatchReference(
+        string packagePath, string? referencePackagePath, ProsperoPackageInspection inspection)
+    {
+        if (string.IsNullOrWhiteSpace(referencePackagePath))
+            throw new InvalidDataException("Patch payload reconstruction requires the base/reference package path.");
+        ProsperoPackageInspection reference = ProsperoPackageReader.Read(referencePackagePath);
+        if (reference.Kind != ProsperoPackageKind.FinalizedDebug)
+            throw new InvalidDataException("Patch reference must be a finalized debug base package; patch-chain references are not yet verified.");
+        if (!string.Equals(reference.Cnt.ContentId, inspection.Cnt.ContentId, StringComparison.Ordinal))
+            throw new InvalidDataException("Patch and reference package content IDs do not match.");
+        if (inspection.Fih is not { } fih || inspection.Lih is not { } lih)
+            throw new InvalidDataException("Patch LIH/FIH geometry is unavailable.");
+
+        using (var patchHeader = File.OpenRead(Path.GetFullPath(packagePath)))
+        using (var referenceHeader = File.OpenRead(Path.GetFullPath(referencePackagePath)))
+        {
+            byte[] expectedReferenceDigest = new byte[32];
+            byte[] actualReferenceDigest = new byte[32];
+            patchHeader.Position = checked((long)lih.FihOffset + 0xD0);
+            patchHeader.ReadExactly(expectedReferenceDigest);
+            referenceHeader.Position = 0x30;
+            referenceHeader.ReadExactly(actualReferenceDigest);
+            if (!expectedReferenceDigest.AsSpan().SequenceEqual(actualReferenceDigest))
+                throw new InvalidDataException("Patch FIH reference digest does not match the supplied base package.");
+        }
+        return (fih, lih);
+    }
+
+    /// <summary>The patch package's own FIH header (0x60 bytes), which follows its LIH.</summary>
+    private static byte[] ReadPatchFihHeader(string packagePath, ProsperoLihHeader lih)
+    {
+        using var stream = File.OpenRead(Path.GetFullPath(packagePath));
+        var header = new byte[0x60];
+        stream.Position = checked((long)lih.FihOffset);
+        stream.ReadExactly(header);
+        return header;
+    }
+
+    /// <summary>
     /// True when a finalized-debug package's decoded inner mount is too large to materialize as one
     /// <c>byte[]</c> (its uncompressed size exceeds <see cref="int.MaxValue"/>), so callers must use
     /// <see cref="ReadFileBacked"/>. The compressed PFS size is not a reliable proxy: a ~1.3 GiB
     /// package can decode to a ~3.5 GiB mount and would otherwise fail the in-memory size check.
     /// </summary>
-    public static bool RequiresFileBacked(string packagePath, string? passcode = null)
+    public static bool RequiresFileBacked(string packagePath, string? passcode = null, string? referencePackagePath = null)
     {
         ProsperoPackageInspection inspection = ProsperoPackageReader.Read(packagePath);
+        if (inspection.Kind == ProsperoPackageKind.FinalizedPatchDebug)
+            return PatchRequiresFileBacked(packagePath, passcode, referencePackagePath, inspection);
         if (inspection.Kind != ProsperoPackageKind.FinalizedDebug || inspection.Fih is not { } fih)
             return false;
         if (fih.PfsSize > (1L << 31))
@@ -176,6 +279,44 @@ public static class ProsperoPackageContent
     }
 
     /// <summary>
+    /// Patch counterpart of <see cref="RequiresFileBacked"/>: true when the reconstructed virtual
+    /// image or its decoded mount exceeds <see cref="int.MaxValue"/>. Needs the reference package
+    /// (the decision reads the patched NAPS through the virtual image); without one the in-memory
+    /// reader surfaces the missing-reference error itself.
+    /// </summary>
+    private static bool PatchRequiresFileBacked(string packagePath, string? passcode,
+        string? referencePackagePath, ProsperoPackageInspection inspection)
+    {
+        if (string.IsNullOrWhiteSpace(referencePackagePath) || inspection.Lih is not { } lih ||
+            inspection.Cnt.ContentId.Length != 36)
+            return false;
+        try
+        {
+            ProsperoPatchRelocation.Tables tables = ProsperoPatchRelocation.Read(packagePath, inspection);
+            if (ProsperoPatchRelocation.VirtualImageLength(tables) > int.MaxValue)
+                return true;
+            using var image = ProsperoPatchVirtualStream.Open(packagePath, referencePackagePath, tables);
+            byte[] fihHeader = ReadPatchFihHeader(packagePath, lih);
+            OuterPfsReader pfs = OuterPfsReader.Open(image, 0, image.Length,
+                OuterSuperblockIndexHint(fihHeader, image.Length));
+            byte[] ekpfs = ProsperoKeys.ComputeEkpfs(inspection.Cnt.ContentId,
+                passcode ?? Gp5.Gp5Constants.DefaultPasscode);
+            (byte[] tweak, byte[] data) = ProsperoKeys.DeriveOuterPfsXtsKeys(ekpfs, pfs.Seed);
+            using var xts = new AesXts(data, tweak);
+            byte[] naps = pfs.ReadNaps(xts);
+            long mountLength = ProsperoPs5InnerImageReader.MountSize(
+                NapsDialectRegistry.Select(naps, pfs.InnerImageLength, candidate =>
+                    NapsDialectRegistry.ProbePfs(candidate, pfs.InnerImageLength,
+                        (offset, length) => pfs.ReadInnerImageRegion(xts, offset, length), InnerSuperblockHint(fihHeader))));
+            return mountLength > int.MaxValue;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or CryptographicException or NotSupportedException or ArgumentException)
+        {
+            return false; // let the normal path surface the real error
+        }
+    }
+
+    /// <summary>
     /// Derive the outer-PFS superblock block index from the FIH header field at 0x20
     /// (<c>0x10000 + superblockOffset</c>), or -1 when it is absent/implausible. The hint only
     /// speeds up <see cref="OuterPfsReader.Open"/>; a wrong hint falls back to a full scan.
@@ -185,6 +326,11 @@ public static class ProsperoPackageContent
         Span<byte> header = stackalloc byte[0x60];
         stream.Position = 0;
         stream.ReadExactly(header);
+        return OuterSuperblockIndexHint(header, pfsSize);
+    }
+
+    private static int OuterSuperblockIndexHint(ReadOnlySpan<byte> header, long pfsSize)
+    {
         ulong field = BinaryPrimitives.ReadUInt64LittleEndian(header.Slice(0x20, 8));
         if (field < OuterPfsReader.BlockSize)
             return -1;
@@ -205,6 +351,11 @@ public static class ProsperoPackageContent
         Span<byte> header = stackalloc byte[0x58];
         stream.Position = 0;
         stream.ReadExactly(header);
+        return InnerSuperblockHint(header);
+    }
+
+    private static long InnerSuperblockHint(ReadOnlySpan<byte> header)
+    {
         ulong blocks = BinaryPrimitives.ReadUInt64LittleEndian(header.Slice(0x50, 8));
         return blocks > 0 ? (long)blocks * ProsperoInnerPfsReader.BlockSize : -1;
     }
@@ -239,28 +390,7 @@ public static class ProsperoPackageContent
     private static ProsperoDecodedPackage ReadPatch(string packagePath, string? referencePackagePath,
         string? passcode, ProsperoPackageInspection inspection)
     {
-        if (string.IsNullOrWhiteSpace(referencePackagePath))
-            throw new InvalidDataException("Patch payload reconstruction requires the base/reference package path.");
-        ProsperoPackageInspection reference = ProsperoPackageReader.Read(referencePackagePath);
-        if (reference.Kind != ProsperoPackageKind.FinalizedDebug)
-            throw new InvalidDataException("Patch reference must be a finalized debug base package; patch-chain references are not yet verified.");
-        if (!string.Equals(reference.Cnt.ContentId, inspection.Cnt.ContentId, StringComparison.Ordinal))
-            throw new InvalidDataException("Patch and reference package content IDs do not match.");
-        if (inspection.Fih is not { } fih || inspection.Lih is not { } lih)
-            throw new InvalidDataException("Patch LIH/FIH geometry is unavailable.");
-
-        using (var patchHeader = File.OpenRead(Path.GetFullPath(packagePath)))
-        using (var referenceHeader = File.OpenRead(Path.GetFullPath(referencePackagePath)))
-        {
-            byte[] expectedReferenceDigest = new byte[32];
-            byte[] actualReferenceDigest = new byte[32];
-            patchHeader.Position = checked((long)lih.FihOffset + 0xD0);
-            patchHeader.ReadExactly(expectedReferenceDigest);
-            referenceHeader.Position = 0x30;
-            referenceHeader.ReadExactly(actualReferenceDigest);
-            if (!expectedReferenceDigest.AsSpan().SequenceEqual(actualReferenceDigest))
-                throw new InvalidDataException("Patch FIH reference digest does not match the supplied base package.");
-        }
+        (ProsperoFihHeader fih, ProsperoLihHeader lih) = ValidatePatchReference(packagePath, referencePackagePath, inspection);
 
         using var package = File.OpenRead(Path.GetFullPath(packagePath));
         OuterPfsReader pfs = OuterPfsReader.Open(package, checked((long)fih.PfsOffset), checked((long)fih.PfsSize));
@@ -286,7 +416,7 @@ public static class ProsperoPackageContent
 
         ProsperoPatchRelocation.Tables tables = ProsperoPatchRelocation.Read(packagePath, inspection);
         byte[] encryptedVirtualImage = ProsperoPatchRelocation.MaterializeEncryptedVirtualImage(
-            packagePath, referencePackagePath, tables);
+            packagePath, referencePackagePath!, tables);
         byte[] mount = ProsperoPs5InnerImageReader.ReconstructRunEncryptedMount(encryptedVirtualImage, naps, xts);
         _ = ProsperoInnerPfsReader.Enumerate(mount);
         return new ProsperoDecodedPackage(inspection, encryptedVirtualImage, naps, mount, [], pfs.VerifySuperblockIcv());
@@ -489,16 +619,17 @@ public static class ProsperoPackageVerifier
             // Multi-GB finalized-debug PFS images cannot be materialized as one byte[]; the
             // in-memory reader rejects them, so mirror img_info and reconstruct via the
             // file-backed reader instead of reporting the whole payload as unavailable.
-            bool large = inspection.Kind == ProsperoPackageKind.FinalizedDebug &&
-                ProsperoPackageContent.RequiresFileBacked(packagePath, passcode);
+            bool large = inspection.Kind is ProsperoPackageKind.FinalizedDebug or ProsperoPackageKind.FinalizedPatchDebug &&
+                ProsperoPackageContent.RequiresFileBacked(packagePath, passcode, referencePackagePath);
             if (large)
             {
-                using ProsperoFileBackedPackage fileBacked = ProsperoPackageContent.ReadFileBacked(packagePath, passcode);
+                using ProsperoFileBackedPackage fileBacked = ProsperoPackageContent.ReadFileBacked(packagePath, passcode,
+                    referencePackagePath: referencePackagePath);
                 // Verification keeps its full decode pass (validating every stored/Kraken block) but
                 // streams it on demand instead of reconstructing a multi-GB temp mount.
                 fileBacked.DecodeAllBlocks();
                 AddDecodedChecks(Add, fileBacked.Blocks, fileBacked.Entries, fileBacked.OuterPfsIcvValid,
-                    ProsperoPackageKind.FinalizedDebug);
+                    inspection.Kind);
             }
             else
             {
