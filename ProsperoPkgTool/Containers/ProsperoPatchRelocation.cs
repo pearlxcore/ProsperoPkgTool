@@ -49,26 +49,23 @@ public static class ProsperoPatchRelocation
         if (tables.Count < 2)
             throw new InvalidDataException("Patch relocation table contains no virtual PFS blocks.");
 
-        using var patch = File.OpenRead(Path.GetFullPath(patchPath));
-        using var reference = File.OpenRead(Path.GetFullPath(referencePath));
-        var virtualImage = new byte[checked((tables.Count - 1) * BlockSize)];
-        for (int destination = 1; destination < tables.Count; destination++)
-        {
-            uint origin = tables.Origin[destination];
-            uint gathered = tables.Gathered[destination];
-            bool inherited = origin != Missing;
-            bool local = gathered != Missing;
-            if (inherited == local)
-                throw new InvalidDataException($"Patch relocation destination block {destination} must have exactly one source.");
-            uint sourceBlock = inherited ? origin : gathered;
-            Stream source = inherited ? reference : patch;
-            long sourceOffset = checked((long)sourceBlock * BlockSize);
-            if (sourceOffset < 0 || sourceOffset > source.Length - BlockSize)
-                throw new InvalidDataException($"Patch relocation source block {sourceBlock} is outside the {(inherited ? "reference" : "patch")} package.");
-            source.Position = sourceOffset;
-            source.ReadExactly(virtualImage.AsSpan((destination - 1) * BlockSize, BlockSize));
-        }
+        long virtualImageLength = VirtualImageLength(tables);
+        if (virtualImageLength > int.MaxValue)
+            throw ProsperoErrorInfo.Unsupported(
+                $"Reconstructed patch mount exceeds the supported in-memory size: {tables.Count - 1} virtual blocks " +
+                $"({virtualImageLength >> 30} GiB); use the file-backed patch reader.");
+
+        using var image = ProsperoPatchVirtualStream.Open(patchPath, referencePath, tables);
+        var virtualImage = new byte[(int)virtualImageLength];
+        image.ReadExactly(virtualImage);
         return virtualImage;
+    }
+
+    /// <summary>Size in bytes of the patched outer-PFS image the relocation tables describe.</summary>
+    public static long VirtualImageLength(Tables tables)
+    {
+        ArgumentNullException.ThrowIfNull(tables);
+        return Math.Max(0, tables.Count - 1) * (long)BlockSize;
     }
 
     private static uint[] ReadTable(ZipArchive archive, string name)

@@ -421,6 +421,7 @@ public static class CliApplication
     {
         string? package = null;
         string? passcode = null;
+        string? referencePackage = null;
         bool noPasscode = false;
         for (int i = 0; i < args.Length; i++)
         {
@@ -435,6 +436,9 @@ public static class CliApplication
                 case "--tmp_path" when i + 1 < args.Length:
                     i++; // accepted for parity; temporary directory is unused
                     break;
+                case "--ref_pkg_path" when i + 1 < args.Length:
+                    referencePackage = args[++i];
+                    break;
                 default:
                     if (args[i].StartsWith("--", StringComparison.Ordinal))
                         return UnknownOption(args[i]);
@@ -444,7 +448,7 @@ public static class CliApplication
         }
         if (package is null)
         {
-            Console.Error.WriteLine("Usage: ProsperoPkgTool img_info [--passcode <passcode>|--no_passcode] <package>");
+            Console.Error.WriteLine("Usage: ProsperoPkgTool img_info [--ref_pkg_path <reference.pkg>] [--passcode <passcode>|--no_passcode] <package>");
             return 2;
         }
 
@@ -466,14 +470,13 @@ public static class CliApplication
 
         // Multi-GB finalized-debug PFS images cannot be materialized as one byte[]; use the
         // file-backed reader.
-        bool large = structural.Kind == ProsperoPackageKind.FinalizedDebug &&
-            ProsperoPackageContent.RequiresFileBacked(package, noPasscode ? null : passcode);
+        bool large = IsFileBacked(structural.Kind, package, noPasscode ? null : passcode, referencePackage);
         if (large)
         {
             try
             {
                 using ProsperoFileBackedPackage fileBacked =
-                    ProsperoPackageContent.ReadFileBacked(package, noPasscode ? null : passcode);
+                    ProsperoPackageContent.ReadFileBacked(package, noPasscode ? null : passcode, referencePackagePath: referencePackage);
                 PrintDecodedSummary(fileBacked.Naps, fileBacked.Blocks, fileBacked.Entries);
                 PrintPlayGoSummary(package, structural);
                 return structural.Structure.IsValid ? 0 : 4;
@@ -493,7 +496,7 @@ public static class CliApplication
         }
 
         ProsperoDecodedPackage decoded;
-        try { decoded = ProsperoPackageContent.Read(package, noPasscode ? null : passcode); }
+        try { decoded = ProsperoPackageContent.Read(package, noPasscode ? null : passcode, referencePackage); }
         catch (Exception ex) when (ex is IOException or InvalidDataException or System.Security.Cryptography.CryptographicException)
         {
             if (!IsEncryptionRequired(ex))
@@ -1194,9 +1197,8 @@ public static class CliApplication
 
         var console = new ConsoleProgress(verbose);
 
-        if (ProsperoPackageReader.Read(package).Kind == ProsperoPackageKind.FinalizedDebug &&
-            ProsperoPackageContent.RequiresFileBacked(package, noPasscode ? null : passcode))
-            return RunInnerImageExtractFileBacked(package, selection, output, noPasscode ? null : passcode, mountMode, console);
+        if (IsFileBacked(ProsperoPackageReader.Read(package).Kind, package, noPasscode ? null : passcode, referencePackage))
+            return RunInnerImageExtractFileBacked(package, selection, output, noPasscode ? null : passcode, mountMode, console, referencePackage);
 
         ProsperoDecodedPackage decoded = ProsperoPackageContent.Read(package, noPasscode ? null : passcode, referencePackage);
         if (mountMode)
@@ -1248,9 +1250,11 @@ public static class CliApplication
     }
 
     private static int RunInnerImageExtractFileBacked(
-        string package, string? selection, string output, string? passcode, bool mountMode, ConsoleProgress console)
+        string package, string? selection, string output, string? passcode, bool mountMode, ConsoleProgress console,
+        string? referencePackage)
     {
-        using ProsperoFileBackedPackage fileBacked = ProsperoPackageContent.ReadFileBacked(package, passcode);
+        using ProsperoFileBackedPackage fileBacked = ProsperoPackageContent.ReadFileBacked(package, passcode,
+            referencePackagePath: referencePackage);
         if (mountMode)
         {
             Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
@@ -1323,15 +1327,14 @@ public static class CliApplication
         ProsperoPackageInspection inspection = ProsperoPackageReader.Read(package);
         try
         {
-            bool large = inspection.Kind == ProsperoPackageKind.FinalizedDebug &&
-                ProsperoPackageContent.RequiresFileBacked(package, passcode);
+            bool large = IsFileBacked(inspection.Kind, package, passcode, referencePackage);
             string prefix = NormalizeInnerSelection(subtree);
             if (repairOffsets)
                 Console.Error.WriteLine("Note: reconstructing truncated 64-bit directory offsets for listing; file data offsets may remain truncated.");
             IReadOnlyList<ProsperoInnerPfsReader.Entry> all;
             if (large)
             {
-                using ProsperoFileBackedPackage fileBacked = ProsperoPackageContent.ReadFileBacked(package, passcode, repairOffsets);
+                using ProsperoFileBackedPackage fileBacked = ProsperoPackageContent.ReadFileBacked(package, passcode, repairOffsets, referencePackage);
                 all = fileBacked.Entries;
                 foreach (ProsperoInnerPfsReader.Entry entry in all
                     .Where(e => e.Path == prefix || e.Path.StartsWith(prefix + "/", StringComparison.Ordinal)))
@@ -1361,6 +1364,19 @@ public static class CliApplication
             return inspection.Structure.IsValid ? 0 : 4;
         }
     }
+
+    /// <summary>
+    /// Multi-GB finalized-debug PFS images, and debug patches whose reconstructed image is that
+    /// large, cannot be materialized as one byte[]; route them through the file-backed reader.
+    /// </summary>
+    private static bool IsFileBacked(ProsperoPackageKind kind, string package, string? passcode, string? referencePackage) =>
+        kind switch
+        {
+            ProsperoPackageKind.FinalizedDebug => ProsperoPackageContent.RequiresFileBacked(package, passcode),
+            ProsperoPackageKind.FinalizedPatchDebug => referencePackage is not null &&
+                ProsperoPackageContent.RequiresFileBacked(package, passcode, referencePackage),
+            _ => false,
+        };
 
     private static bool IsEncryptionRequired(Exception ex) =>
         ex is System.Security.Cryptography.CryptographicException
@@ -1624,7 +1640,7 @@ public static class CliApplication
         Console.WriteLine("  native-decrypt <pkg> --passcode <32 chars> [--out <inner-image.bin>]");
         Console.WriteLine("                          Derive keys, verify the superblock, decrypt the outer PFS");
         Console.WriteLine("  img_info <pkg>          Summarize package, container, and decoded inner-image state");
-        Console.WriteLine("                          [--passcode <passcode>|--no_passcode] [--tmp_path <dir>]");
+        Console.WriteLine("                          [--ref_pkg_path <base.pkg>] [--passcode <passcode>|--no_passcode] [--tmp_path <dir>]");
         Console.WriteLine("  img_file_list <pkg>     List logical inner-PFS paths; patches use --ref_pkg_path <base.pkg>");
         Console.WriteLine("                          [--passcode <passcode>|--no_passcode] [--path <inner-path>] [--repair-offsets]");
         Console.WriteLine("  img_extract <pkg> <out> Extract logical files; patches use --ref_pkg_path <base.pkg>");
